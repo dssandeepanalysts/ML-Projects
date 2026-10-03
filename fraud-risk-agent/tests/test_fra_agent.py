@@ -187,6 +187,8 @@ def test_llm_text_is_used_when_it_passes_the_checks(make_request):
         "A potential duplicate was flagged, which is a key phrase. There is no data note provided.",  # prompt talk
         "Several indicators warrant further review: a potential duplicate was flagged.",  # judgement
         "Indicators:\n- a potential duplicate of this claim was already flagged",  # list
+        "Two indicators were found: a potential duplicate of this claim was already flagged.",  # miscount
+        "A potential duplicate was flagged. Claim history could not be retrieved.",  # invents missing data
         "A potential duplicate was flagged, giving a risk score of 70.",  # invented number
         "**Potential duplicate** flagged against the policy.",  # markup
         "The claim was reported quickly and nothing else was found.",  # misses the indicator
@@ -198,6 +200,13 @@ def test_bad_or_missing_llm_text_falls_back_to_template(make_request, reply):
     request = make_request(**DUPLICATE)
     result = FraudRiskAgent(llm=fake_llm(reply)).assess(request)
     assert result == AGENT.assess(request)  # same numbers, template wording
+
+
+def test_missing_data_sentence_is_required_when_data_was_missing(make_request):
+    request = make_request(policy_data_available=False, **DUPLICATE)
+    note = " Policy details could not be verified with the policy service, so this assessment is based on incomplete data."
+    assert FraudRiskAgent(llm=fake_llm(GOOD_REPLY)).assess(request) == AGENT.assess(request)  # note left out
+    assert FraudRiskAgent(llm=fake_llm(GOOD_REPLY + note)).assess(request)["reasoning"] == " ".join((GOOD_REPLY + note).split())
 
 
 def test_llm_never_sees_description_or_hashes(make_request):
