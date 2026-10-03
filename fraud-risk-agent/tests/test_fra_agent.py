@@ -183,6 +183,10 @@ def test_llm_text_is_used_when_it_passes_the_checks(make_request):
     "reply",
     [
         "This claim looks fraudulent: a potential duplicate was flagged.",  # accusatory
+        # Patterns seen from llama3.2 in the CI smoke run:
+        "A potential duplicate was flagged, which is a key phrase. There is no data note provided.",  # prompt talk
+        "Several indicators warrant further review: a potential duplicate was flagged.",  # judgement
+        "Indicators:\n- a potential duplicate of this claim was already flagged",  # list
         "A potential duplicate was flagged, giving a risk score of 70.",  # invented number
         "**Potential duplicate** flagged against the policy.",  # markup
         "The claim was reported quickly and nothing else was found.",  # misses the indicator
