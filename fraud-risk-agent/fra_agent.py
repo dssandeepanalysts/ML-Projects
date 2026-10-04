@@ -31,11 +31,12 @@ import json
 import logging
 import os
 import re
+import threading
 import time
-import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import date
 
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
 
@@ -79,14 +80,22 @@ REQUIRED_FIELDS = {
     "history_data_available": bool,
 }
 TYPE_NAMES = {str: "a string", int: "an integer", bool: "a boolean"}
+UUID_V4 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", re.IGNORECASE)
 
 # Personal and damage data must never reach this agent (spec s5.2, Blueprint 13.3).
-# The spec names the data but not the JSON keys, so this is a deny-list of likely key names.
+# The spec names the data but not the JSON keys, so this is a deny-list of likely key names,
+# compared after normalising (lower case, letters and digits only): snake_case, camelCase and
+# Pega's PascalCase (DateOfBirth, PolicyNumber, ConfidenceScore) all match.
 FORBIDDEN_KEYS = {
-    "claimant_name", "first_name", "last_name", "date_of_birth", "dob", "phone", "email",
-    "address", "postal_address", "vehicle_make", "vehicle_model", "vehicle_year", "make",
-    "model", "year", "photos", "photo_urls", "policy_number", "vin", "estimated_cost",
-    "severity", "severity_level", "damage_confidence", "damage_assessment",
+    # claimant
+    "name", "claimantname", "fullname", "firstname", "lastname", "dateofbirth", "dob",
+    "phone", "phonenumber", "mobile", "email", "emailaddress", "address", "postaladdress",
+    # vehicle and policy in clear text, photos
+    "make", "model", "year", "vehiclemake", "vehiclemodel", "vehicleyear", "vin",
+    "policynumber", "photo", "photos", "photourls",
+    # the damage agent's output (Blueprint 12.3)
+    "estimatedcost", "damageestimate", "severity", "severitylevel", "confidencescore",
+    "damageconfidence", "damageassessment",
 }
 
 # Instruction-like text in the claimant's description. It cannot change the result (the
@@ -145,18 +154,25 @@ def _get(payload: dict, path: str):
     return node
 
 
-def _all_keys(node):
-    if isinstance(node, dict):
-        for key, value in node.items():
-            yield str(key).lower()
-            yield from _all_keys(value)
-    elif isinstance(node, list):
-        for value in node:
-            yield from _all_keys(value)
+def _normalise_key(key) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+
+def _all_keys(payload) -> set[str]:
+    """Every key at any depth, normalised. Iterative, so deep nesting cannot overflow the stack."""
+    keys, stack = set(), [payload]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            keys.update(_normalise_key(key) for key in node)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return keys
 
 
 def _is_iso_date(value: str) -> bool:
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
         return False
     try:
         date.fromisoformat(value)
@@ -173,8 +189,9 @@ def validate_request(payload) -> str | None:
     """
     if not isinstance(payload, dict):
         return "The request body must be a JSON object."
-    leaked = sorted(FORBIDDEN_KEYS & set(_all_keys(payload)))
+    leaked = sorted(FORBIDDEN_KEYS & _all_keys(payload))
     if leaked:
+        # Normalised names only (letters and digits), never the values.
         return f"The request contains fields that must never be sent to this agent: {', '.join(leaked)}."
 
     for path, expected in REQUIRED_FIELDS.items():
@@ -187,8 +204,8 @@ def validate_request(payload) -> str | None:
             return f"Field {path} must be {TYPE_NAMES[expected]}."
 
     checks = [
-        ("claim_id", re.fullmatch(r"AC-\d{4,}", payload["claim_id"]), "must match the pattern AC-nnnn"),
-        ("correlation_id", _is_uuid(payload["correlation_id"]), "must be a UUID"),
+        ("claim_id", re.fullmatch(r"AC-[0-9]{4,}", payload["claim_id"]), "must match the pattern AC-nnnn"),
+        ("correlation_id", re.fullmatch(UUID_V4, payload["correlation_id"]), "must be a UUID v4"),
         ("policy_ref_hash", re.fullmatch(r"[0-9a-fA-F]{16,}", payload["policy_ref_hash"]), "must be a hex-encoded hash"),
         ("vin_hash", re.fullmatch(r"[0-9a-fA-F]{16,}", payload["vin_hash"]), "must be a hex-encoded hash"),
         ("loss.cause", payload["loss"]["cause"] in LOSS_CAUSES, "is not one of the eight allowed causes"),
@@ -201,14 +218,6 @@ def validate_request(payload) -> str | None:
         if not ok:
             return f"Field {path} {rule}."
     return None
-
-
-def _is_uuid(value: str) -> bool:
-    try:
-        uuid.UUID(value)
-        return True
-    except ValueError:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -335,11 +344,14 @@ One indicator was found on this fire claim: the claimed vehicle does not match a
 
 PROMPT = ChatPromptTemplate.from_messages([("system", SYSTEM_PROMPT), ("human", "{facts}")])
 
-# Wording the spec rules out (s9): accusations, judgements and recommendations.
+# Wording the spec rules out (s9): accusations, judgements and recommendations. Word stems, so
+# "fraudulently", "suspected" or "faked" are caught too; only the phrase "fraud indicator(s)" is allowed.
 JUDGEMENTAL = re.compile(
-    r"\b(fraudulent|fraudsters?|liars?|lying|lied|criminal|crime|guilty|scam|fake|dishonest"
-    r"|deceptive|deceit|suspicious|suspect|staged|illegal|concern\w*|unusual|red flags?|warrant\w*"
-    r"|further review|investigat\w*|recommend\w*|deviat\w*|likely|should)\b",
+    r"\b(fraud(?!\s+indicators?\b)\w*|liars?|l(?:ie|ies|ied|ying)|crimin\w*|crimes?|guilt\w*|scam\w*"
+    r"|fak(?:e|ed|es|ery|ing)|fabricat\w*|falsif\w*|bogus|dubious|questionable|dishonest\w*|decei\w*"
+    r"|decept\w*|suspicio\w*|suspect\w*|staged|illegal\w*|irregular\w*|concern\w*|unusual\w*|red flags?"
+    r"|warrant\w*|further review|investigat\w*|recommend\w*|deviat\w*|probabl\w*|likely|should|must"
+    r"|den(?:y|ies|ied|ial)|reject\w*|declin\w*|siu)\b",
     re.IGNORECASE,
 )
 # Talk about the prompt itself ("which is a key phrase", "no data note provided").
@@ -347,11 +359,26 @@ META = re.compile(
     r"key[ _]phrase|data[ _]note|data completeness|\b(facts?|findings?|instructions?|prompt|input|output)\b|as an ai",
     re.IGNORECASE,
 )
-# "Two indicators were found", "an indicator", "3 indicators": the stated count must be right.
-INDICATOR_COUNT = re.compile(r"\b(\d+|an?|one|two|three|four|five)\s+(?:single\s+|fraud\s+)?indicators?\b", re.IGNORECASE)
-COUNT_VALUES = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+# "Two indicators were found", "an indicator", "both indicators": any stated count must be right.
+INDICATOR_COUNT = re.compile(
+    r"\b(\d+|an?|one|two|three|four|five|both|several|multiple|many|some)\s+(?:[a-z-]+\s+){0,2}?indicators?\b",
+    re.IGNORECASE,
+)
+COUNT_VALUES = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "both": 2}
 LIST_ITEM = re.compile(r"^\s*([-\u2022]|\d+[.)])\s", re.MULTILINE)
 MARKUP = re.compile(r"[*#`<>\[\]{}|_\\]")
+# Closed vocabulary: once the exact indicator sentences and the missing-data sentence are removed,
+# only these linking words (plus the cause of loss) may remain. Anything else is a new claim.
+LINKING_WORDS = set(
+    "a an one two three four five both indicator indicators was were found identified on in for of "
+    "this the claim and also additionally addition further furthermore moreover as well while with "
+    "which its it is are has have there these following".split()
+)
+NO_OTHER_INDICATORS = re.compile(r"no other indicators? (?:was|were) found", re.IGNORECASE)
+
+# Total time allowed for one LLM explanation; Pega allows 15 s per attempt (spec s10.1).
+LLM_TIMEOUT = float(os.getenv("FRA_LLM_TIMEOUT", "8"))
+_LLM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="fra-llm")
 
 
 def build_ollama_llm() -> ChatOllama:
@@ -362,8 +389,8 @@ def build_ollama_llm() -> ChatOllama:
         temperature=0,  # with a fixed seed, repeat calls get the same wording
         seed=42,
         num_predict=200,
-        # Pega allows 15 s per attempt; leave headroom for the template fallback.
-        client_kwargs={"timeout": float(os.getenv("FRA_LLM_TIMEOUT", "8"))},
+        # Per-read guard; the total deadline is enforced in llm_reasoning.
+        client_kwargs={"timeout": LLM_TIMEOUT},
     )
 
 
@@ -372,6 +399,17 @@ def _echoes(source: str, text: str, n: int = 6) -> bool:
     words = re.findall(r"[a-z0-9']+", source.lower())
     flat = " ".join(re.findall(r"[a-z0-9']+", text.lower()))
     return any(" ".join(words[i : i + n]) in flat for i in range(len(words) - n + 1))
+
+
+def _unexplained_words(text: str, req: dict, fired: list[str]) -> list[str]:
+    """Words left after removing the exact facts, the opener and "no other indicators were found"."""
+    rest = " ".join(text.lower().split())
+    for phrase in [indicator_phrase(code, req) for code in fired] + [data_note(req)]:
+        if phrase:
+            rest = rest.replace(phrase.lower(), " ")
+    rest = NO_OTHER_INDICATORS.sub(" ", rest)
+    allowed = LINKING_WORDS | {req["loss"]["cause"].lower()}
+    return [word for word in re.findall(r"[a-z0-9']+", rest) if word not in allowed]
 
 
 def narrative_problems(raw: str, req: dict, fired: list[str]) -> list[str]:
@@ -387,16 +425,20 @@ def narrative_problems(raw: str, req: dict, fired: list[str]) -> list[str]:
         problems.append("judgemental wording")
     if META.search(text):
         problems.append("talks about the prompt")
-    if any(KEY_PHRASES[code] not in lowered for code in fired):
+    # Every fired indicator in its exact wording, so its numbers stay attached to the right fact.
+    if any(indicator_phrase(code, req).lower() not in lowered for code in fired):
         problems.append("missing indicator")
     if any(KEY_PHRASES[code] in lowered for code in INDICATORS if code not in fired):
         problems.append("indicator that did not fire")
-    stated = {int(w) if w.isdigit() else COUNT_VALUES[w.lower()] for w in INDICATOR_COUNT.findall(text)}
-    if stated - {len(fired)}:
+    stated = [COUNT_VALUES.get(w.lower(), int(w) if w.isdigit() else None) for w in INDICATOR_COUNT.findall(text)]
+    if any(n != len(fired) for n in stated):
         problems.append("wrong indicator count")
-    # Missing data must be stated when it applies, and only then (every note says "could not be").
-    if bool(data_note(req)) != ("could not be" in lowered):
+    # The missing-data sentence exactly when data was missing; never an invented one.
+    note = data_note(req)
+    if (note and note.lower() not in lowered) or (not note and "could not be" in lowered):
         problems.append("missing-data sentence wrong")
+    if _unexplained_words(text, req, fired):
+        problems.append("adds words beyond the facts")
     # Fact check: every number must come from the facts (stops invented scores or counts).
     allowed = set(re.findall(r"\d+", template_reasoning(req, fired))) | {str(len(fired))}
     if set(re.findall(r"\d+", text)) - allowed:
@@ -408,15 +450,36 @@ def narrative_problems(raw: str, req: dict, fired: list[str]) -> list[str]:
     return problems
 
 
-def llm_reasoning(chain, req: dict, fired: list[str]) -> str | None:
+def _generate(llm, facts: str, stop: threading.Event) -> str:
+    # Stream the model itself rather than a prompt|llm|parser chain: closing the model's own
+    # stream drops the HTTP connection at once (so Ollama stops), a chain only closes when done.
+    stream = llm.stream(PROMPT.invoke({"facts": facts}))
+    parts = []
+    try:
+        for chunk in stream:
+            if stop.is_set():
+                break  # the caller already gave up at its deadline
+            parts.append(getattr(chunk, "content", chunk))
+    finally:
+        stream.close()
+    return "".join(parts)
+
+
+def llm_reasoning(llm, req: dict, fired: list[str]) -> str | None:
     """Ask the LLM to reword the template facts. Returns None when the text cannot be used."""
     lines = [f"Cause of loss: {req['loss']['cause'].lower()}", f"Number of indicators: {len(fired)}"]
     lines += [f"- {indicator_phrase(code, req)}" for code in fired]
     if data_note(req):
         lines.append(f"Final sentence: {data_note(req)}")
+    stop = threading.Event()
+    future = _LLM_POOL.submit(_generate, llm, "\n".join(lines), stop)
     try:
-        text = chain.invoke({"facts": "\n".join(lines)})
-    except Exception as exc:  # Ollama down, model missing, timeout...
+        text = future.result(timeout=LLM_TIMEOUT)
+    except FutureTimeout:  # a slow model must not push the reply past Pega's timeout
+        stop.set()
+        log.warning("claim_id=%s LLM exceeded %.1f s; using template", req["claim_id"], LLM_TIMEOUT)
+        return None
+    except Exception as exc:  # Ollama down, model missing, read timeout...
         log.warning("claim_id=%s LLM unavailable (%s); using template", req["claim_id"], type(exc).__name__)
         return None
     text = re.sub(r"<think>.*?</think>", "", str(text), flags=re.DOTALL)  # reasoning models
@@ -430,6 +493,12 @@ def llm_reasoning(chain, req: dict, fired: list[str]) -> str | None:
 # ---------------------------------------------------------------------------
 # The agent: validate -> score -> explain -> self-check -> respond
 # ---------------------------------------------------------------------------
+def _log_id(value) -> str:
+    """An identifier as it may appear in a log line: plain [A-Za-z0-9-] text, else a placeholder,
+    so a crafted claim_id or correlation_id cannot forge log lines or smuggle data into logs."""
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", value) else "<invalid>"
+
+
 def failed(reason: str) -> dict:
     # FAILED carries no risk_score, confidence or risk_flags (spec s6.2.1, AT-7).
     return {"status": "FAILED", "reasoning": reason}
@@ -457,11 +526,11 @@ class FraudRiskAgent:
     def __init__(self, llm=None):
         # llm: any LangChain chat model or runnable (ChatOllama in production, a fake in
         # tests). None means template reasoning only.
-        self.chain = (PROMPT | llm | StrOutputParser()) if llm is not None else None
+        self.llm = llm
 
     def assess(self, payload) -> dict:
         started = time.perf_counter()
-        source = "-"
+        source, error = "-", None
         try:
             error = validate_request(payload)
             if error:
@@ -477,12 +546,15 @@ class FraudRiskAgent:
             response = failed("An internal error occurred while processing this request.")
 
         claim_id = payload.get("claim_id") if isinstance(payload, dict) else None
+        correlation_id = payload.get("correlation_id") if isinstance(payload, dict) else None
         if isinstance(claim_id, str):
             response = {"claim_id": claim_id, **response}  # echoed for correlation (spec s5.2)
+        if error:  # names fields only, never values (spec s5.2: "log it and return FAILED")
+            log.warning("claim_id=%s contract violation: %s", _log_id(claim_id), error)
         # Only identifiers and outcomes are logged: never the description or the hashes.
         log.info(
             "claim_id=%s correlation_id=%s status=%s risk_score=%s confidence=%s flags=%s narrative=%s ms=%.1f",
-            claim_id, payload.get("correlation_id") if isinstance(payload, dict) else None,
+            _log_id(claim_id), _log_id(correlation_id),
             response["status"], response.get("risk_score"), response.get("confidence"),
             ",".join(response.get("risk_flags", [])) or "-", source, (time.perf_counter() - started) * 1000,
         )
@@ -493,8 +565,8 @@ class FraudRiskAgent:
             log.warning("claim_id=%s loss.description contains instruction-like text (ignored)", req["claim_id"])
         fired = fired_indicators(req)
         reasoning, source = None, "template"
-        if self.chain is not None and fired:  # nothing to reword when no indicator fired
-            reasoning = llm_reasoning(self.chain, req, fired)
+        if self.llm is not None and fired:  # nothing to reword when no indicator fired
+            reasoning = llm_reasoning(self.llm, req, fired)
             source = "llm" if reasoning else "template-fallback"
         response = {
             "status": "COMPLETED",

@@ -3,16 +3,20 @@
 No Ollama needed: the LLM is replaced by a RunnableLambda that returns canned text.
 """
 import json
+import logging
+import time
 from pathlib import Path
 
 import pytest
 from langchain_core.runnables import RunnableLambda
 
 import fra_agent
-from fra_agent import INDICATORS, FraudRiskAgent, read_csv_rows, row_to_request
+from fra_agent import INDICATORS, FraudRiskAgent, fired_indicators, narrative_problems, read_csv_rows, row_to_request
 
 DATA = Path(__file__).resolve().parents[1] / "data" / "fra_synthetic_claims_1500.csv"
+ROWS = read_csv_rows(DATA)
 AGENT = FraudRiskAgent()  # template reasoning only
+WITHHELD = "The agent produced an out-of-range result and withheld it."
 
 ALL_FIVE = {
     "vehicle_policy_mismatch": True,
@@ -41,6 +45,7 @@ ALL_FIVE = {
 )
 def test_acceptance_scores(make_request, changes, score, flags):
     result = AGENT.assess(make_request(**changes))
+    assert result["claim_id"] == "AC-1001"  # echoed (spec s5.2)
     assert result["status"] == "COMPLETED"
     assert result["risk_score"] == score
     assert result["confidence"] == 100
@@ -102,6 +107,11 @@ def test_reasoning_wording(make_request):
         ({"claim_id": "1001"}, "claim_id"),
         ({"correlation_id": "not-a-uuid"}, "correlation_id"),
         ({"vin_hash": "not-a-hash"}, "vin_hash"),
+        ({"claim_id": 123}, "claim_id"),  # wrong type on a string field
+        ({"loss__description": 1}, "loss.description"),
+        ({"claim_id": "AC-\u0661\u0660\u0660\u0661"}, "claim_id"),  # non-ASCII digits
+        ({"correlation_id": "00000000-0000-0000-0000-000000000000"}, "correlation_id"),  # not a v4 UUID
+        ({"correlation_id": "3f6c1b0a-7e2d-4c91-9a08-1d5e6f2b8c41\n"}, "correlation_id"),
     ],
 )
 def test_invalid_fields_fail(make_request, changes, field):
@@ -110,9 +120,26 @@ def test_invalid_fields_fail(make_request, changes, field):
     assert field in result["reasoning"]
 
 
-@pytest.mark.parametrize("changes", [{"claimant_name": "A Person"}, {"loss__vin": "MA3EYD32S00123456"}])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"claimant_name": "A Person"},
+        {"loss__vin": "MA3EYD32S00123456"},
+        {"PolicyNumber": "P-1"},  # Pega property names (Blueprint data model)
+        {"DateOfBirth": "1990-01-01"},
+        {"confidence_score": 88},  # the damage agent's output (Blueprint 12.3)
+        {"loss__EstimatedCost": 1200},
+    ],
+)
 def test_personal_data_is_rejected(make_request, changes):
     assert AGENT.assess(make_request(**changes))["status"] == "FAILED"
+
+
+def test_deeply_nested_extra_field_does_not_crash(make_request):
+    deep = []
+    for _ in range(100_000):
+        deep = [deep]
+    assert AGENT.assess(make_request(future_optional_field=deep))["status"] == "COMPLETED"
 
 
 def test_unknown_optional_field_is_ignored(make_request):
@@ -124,9 +151,18 @@ def test_non_object_payload_fails(payload):
     assert AGENT.assess(payload) == {"status": "FAILED", "reasoning": "The request body must be a JSON object."}
 
 
-def test_out_of_range_result_is_withheld(make_request, monkeypatch):
-    monkeypatch.setattr(fra_agent, "risk_score", lambda fired: 140)
-    assert AGENT.assess(make_request())["status"] == "FAILED"
+@pytest.mark.parametrize(
+    "target, bug",
+    [
+        ("risk_score", lambda fired: 140),
+        ("compute_confidence", lambda req: 70),
+        ("fired_indicators", lambda req: ["DUPLICATE_PATTERN", "DUPLICATE_PATTERN"]),
+        ("template_reasoning", lambda req, fired: "x" * 2001),
+    ],
+)
+def test_out_of_range_result_is_withheld(make_request, monkeypatch, target, bug):  # spec s11, row 4
+    monkeypatch.setattr(fra_agent, target, bug)
+    assert AGENT.assess(make_request()) == {"claim_id": "AC-1001", "status": "FAILED", "reasoning": WITHHELD}
 
 
 def test_internal_error_becomes_failed(make_request, monkeypatch):
@@ -141,17 +177,15 @@ def test_internal_error_becomes_failed(make_request, monkeypatch):
 
 # --- Synthetic dataset: every row reproduced exactly ---------------------------------------
 def test_reproduces_all_1500_dataset_rows():
-    rows = read_csv_rows(DATA)
-    assert len(rows) == 1500
-    for row in rows:
+    assert len(ROWS) == 1500
+    for row in ROWS:
         result = AGENT.assess(row_to_request(row))
         expected = (int(row["risk_score"]), int(row["confidence"]), json.loads(row["risk_flags"]), row["reasoning"])
         assert (result["risk_score"], result["confidence"], result["risk_flags"], result["reasoning"]) == expected, row["claim_id"]
 
 
 def test_injection_rows_are_detected_and_cannot_change_the_result():
-    rows = read_csv_rows(DATA)
-    hits = [r["claim_id"] for r in rows if fra_agent.INJECTION_HINTS.search(r["loss_description"])]
+    hits = [r["claim_id"] for r in ROWS if fra_agent.INJECTION_HINTS.search(r["loss_description"])]
     assert len(hits) == 8  # the data dictionary documents 8 injection-test rows
 
 
@@ -170,7 +204,9 @@ def fake_llm(reply, prompts=None):
 
 
 DUPLICATE = {"claim_history__potential_duplicate": True}
-GOOD_REPLY = "A potential duplicate of this claim was already flagged for the same policy and vehicle.\nNo other indicators were found."
+DUP = "a potential duplicate of this claim was already flagged against the same policy and vehicle"
+OPENER = "One indicator was found on this collision claim: "
+GOOD_REPLY = OPENER + DUP + ".\nNo other indicators were found."
 
 
 def test_llm_text_is_used_when_it_passes_the_checks(make_request):
@@ -200,6 +236,110 @@ def test_bad_or_missing_llm_text_falls_back_to_template(make_request, reply):
     request = make_request(**DUPLICATE)
     result = FraudRiskAgent(llm=fake_llm(reply)).assess(request)
     assert result == AGENT.assess(request)  # same numbers, template wording
+
+
+# Texts that pass the obvious checks but would mislead an adjuster (found in review).
+LATE_AND_CLAIMS = {"claim_history__late_reported": True, "loss__date": "2026-08-10", "claim_history__claims_last_24_months": 3}
+POLICY_DOWN = {"policy_data_available": False, **DUPLICATE}
+
+
+@pytest.mark.parametrize(
+    "changes, reply, problem",
+    [
+        (DUPLICATE, OPENER + DUP + ", which points to a fraudulently filed claim.", "judgemental wording"),
+        (DUPLICATE, OPENER + DUP + ". The claimant is suspected of fraud.", "judgemental wording"),
+        (DUPLICATE, OPENER + DUP + ". This is probably insurance fraud; the adjuster must deny this claim.", "judgemental wording"),
+        (DUPLICATE, OPENER + DUP + ". Reject the payment and refer the claimant to the SIU.", "judgemental wording"),
+        (DUPLICATE, "Both indicators were found on this collision claim: " + DUP + ".", "wrong indicator count"),
+        (DUPLICATE, "Several indicators were found on this collision claim, including " + DUP + ".", "wrong indicator count"),
+        (DUPLICATE, "One indicator was found on this collision claim. There is no potential duplicate of this claim.", "missing indicator"),
+        (  # numbers swapped between two indicators
+            LATE_AND_CLAIMS,
+            "Two indicators were found on this collision claim. The policy has 42 other claims in the last 24 months, "
+            "and the claim was reported 3 days after the loss date, beyond the 30-day reporting threshold.",
+            "missing indicator",
+        ),
+        (DUPLICATE, OPENER + DUP + ", giving a risk score of ninety out of one hundred.", "adds words beyond the facts"),
+        (DUPLICATE, OPENER + DUP + ". The claimant has filed similar claims with other insurers.", "adds words beyond the facts"),
+        (DUPLICATE, "One indicator was found on this theft claim: " + DUP + ".", "adds words beyond the facts"),  # wrong cause
+        (DUPLICATE, OPENER + DUP + ". The claim was also reported late.", "adds words beyond the facts"),  # did not fire
+        (  # missing-data sentence about the wrong source
+            POLICY_DOWN,
+            OPENER + DUP + ". Claim history could not be retrieved, so the recent-claims count was not available for this assessment.",
+            "missing-data sentence wrong",
+        ),
+        (DUPLICATE, OPENER + DUP + ". Claim history was unavailable, so this assessment is based on incomplete data.", "adds words beyond the facts"),
+        (DUPLICATE, OPENER + DUP + ". " + "Also this claim and the claim. " * 30, "length"),
+        (DUPLICATE, OPENER + DUP + ", while waiting for the light to change.", "echoes the claimant's description"),
+    ],
+)
+def test_misleading_llm_text_is_rejected(make_request, changes, reply, problem):
+    request = make_request(**changes)
+    assert problem in narrative_problems(reply, request, fired_indicators(request))
+    assert FraudRiskAgent(llm=fake_llm(reply)).assess(request) == AGENT.assess(request)
+
+
+def test_hash_in_llm_text_is_rejected(make_request):
+    request = make_request(**DUPLICATE)
+    reply = OPENER + DUP + ", reference " + request["policy_ref_hash"][:12] + "."
+    assert "hash value" in narrative_problems(reply, request, fired_indicators(request))
+
+
+# Explanations llama3.2 wrote in the CI smoke run after the prompt fixes: all correct, all must pass.
+REAL_LLAMA_OUTPUTS = {
+    "AC-3001": "One indicator was found on this theft claim: the loss occurred 3 days after the policy start date.",
+    "AC-3002": "One indicator was found on this natural claim: the loss occurred 13 days after the policy start date.",
+    "AC-3004": "One indicator was found on this glass claim: the policy has 4 other claims in the last 24 months. "
+    "Policy details could not be verified with the policy service, so this assessment is based on incomplete data.",
+    "AC-3007": "Four indicators were found on this theft claim. The claimed vehicle does not match any vehicle listed on the "
+    "policy, and the policy has 2 other claims in the last 24 months. The loss occurred 28 days after the policy start "
+    "date, and the claim was reported 94 days after the loss date, beyond the 30-day reporting threshold.",
+    "AC-3016": "Two indicators were found on this glass claim. The loss occurred 17 days after the policy start date, and "
+    "the claim was reported 38 days after the loss date, beyond the 30-day reporting threshold.",
+    "AC-3018": "One indicator was found on this vandalism claim: the loss occurred on the policy start date.",
+    "AC-3021": "One indicator was found on this collision claim: the loss occurred on the policy start date. Policy details "
+    "and claim history could not be fully retrieved, so this assessment is based on incomplete data.",
+    "AC-3024": "Two indicators were found on this collision claim. The claimed vehicle does not match any vehicle listed on "
+    "the policy, and the loss occurred 9 days after the policy start date.",
+    "AC-3019": "One indicator was found on this collision claim. The policy has 3 other claims in the last 24 months.",
+    "AC-3020": "One indicator was found on this collision claim: the loss occurred 8 days after the policy start date.",
+    "AC-3022": "One indicator was found on this vandalism claim: the claim was reported 37 days after the loss date, "
+    "beyond the 30-day reporting threshold.",
+    "AC-3028": "Two indicators were found on this collision claim. The policy has 2 other claims in the last 24 months, "
+    "and the claim was reported 36 days after the loss date, beyond the 30-day reporting threshold.",
+    "AC-3031": "One indicator was found on this vandalism claim: the loss occurred 4 days after the policy start date.",
+    "AC-3042": "One indicator was found on this theft claim: the loss occurred 2 days after the policy start date.",
+    "AC-3047": "One indicator was found on this collision claim. The policy has 3 other claims in the last 24 months.",
+}
+
+
+@pytest.mark.parametrize("claim_id, text", REAL_LLAMA_OUTPUTS.items())
+def test_real_llama_outputs_pass_the_checks(claim_id, text):
+    request = row_to_request(next(r for r in ROWS if r["claim_id"] == claim_id))
+    assert narrative_problems(text, request, fired_indicators(request)) == []
+
+
+def test_slow_llm_falls_back_within_the_deadline(make_request, monkeypatch):
+    monkeypatch.setattr(fra_agent, "LLM_TIMEOUT", 0.2)
+    request = make_request(**DUPLICATE)
+    started = time.perf_counter()
+    result = FraudRiskAgent(llm=RunnableLambda(lambda _: time.sleep(2) or GOOD_REPLY)).assess(request)
+    assert time.perf_counter() - started < 1.5
+    assert result == AGENT.assess(request)
+
+
+def test_logs_hold_no_description_hashes_or_forged_lines(make_request, caplog):  # spec s12.3
+    caplog.set_level(logging.DEBUG, logger="fra")
+    request = make_request(**DUPLICATE)
+    AGENT.assess(request)
+    FraudRiskAgent(llm=fake_llm(GOOD_REPLY)).assess(request)
+    FraudRiskAgent(llm=fake_llm("This is fraud.")).assess(request)
+    AGENT.assess(make_request(claim_id="AC-1001\nINFO claim_id=AC-9999 status=COMPLETED", correlation_id="x\ny"))
+    AGENT.assess(make_request(PolicyNumber="P-1"))
+    assert request["loss"]["description"] not in caplog.text
+    assert request["policy_ref_hash"][:12] not in caplog.text and request["vin_hash"][:12] not in caplog.text
+    assert "AC-9999" not in caplog.text  # a crafted claim_id never reaches the log
+    assert "contract violation" in caplog.text and "policynumber" in caplog.text  # spec s5.2: "log it"
 
 
 def test_missing_data_sentence_is_required_when_data_was_missing(make_request):

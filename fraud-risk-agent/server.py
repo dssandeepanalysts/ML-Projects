@@ -22,10 +22,11 @@ import secrets
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.concurrency import run_in_threadpool
 
-from fra_agent import AGENT_VERSION, FraudRiskAgent, build_ollama_llm
+from fra_agent import AGENT_VERSION, FraudRiskAgent, build_ollama_llm, failed
 
 logging.basicConfig(level=os.getenv("FRA_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one log line per claim is enough
@@ -70,13 +71,23 @@ bearer = HTTPBearer(auto_error=False)
 def require_token(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> None:
     """Reject unauthenticated calls outright (spec s4). Production: validate the OAuth 2.0 JWT instead."""
     expected = os.getenv("FRA_API_TOKEN")
-    if not expected or creds is None or not secrets.compare_digest(creds.credentials, expected):
+    # Compare bytes: compare_digest raises on non-ASCII str, which would turn a bad token into a 500.
+    if not expected or creds is None or not secrets.compare_digest(creds.credentials.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Missing or invalid bearer token.",
                             headers={"WWW-Authenticate": "Bearer"})
 
 
 def rpc_error(rpc_id, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}
+
+
+@app.exception_handler(Exception)
+async def internal_error(request: Request, exc: Exception) -> JSONResponse:
+    """Last resort (spec s11): never a bare 500 or a dropped connection; Pega needs a parseable body."""
+    log.error("unhandled %s on %s", type(exc).__name__, request.url.path)
+    if request.url.path == "/a2a":
+        return JSONResponse(rpc_error(None, -32603, "Internal error"), status_code=500)
+    return JSONResponse(failed("An internal error occurred while processing this request."), status_code=500)
 
 
 @app.get("/health")
@@ -94,7 +105,7 @@ def agent_card() -> dict:
 async def a2a(request: Request) -> dict:
     try:
         rpc = await request.json()
-    except ValueError:
+    except (ValueError, RecursionError):  # invalid or too deeply nested JSON
         return rpc_error(None, -32700, "Parse error")
     if not isinstance(rpc, dict) or rpc.get("jsonrpc") != "2.0" or "method" not in rpc:
         return rpc_error(rpc.get("id") if isinstance(rpc, dict) else None, -32600, "Invalid Request")
@@ -107,6 +118,7 @@ async def a2a(request: Request) -> dict:
         return rpc_error(rpc.get("id"), -32602, "Invalid params: expected a message with a data part")
 
     result = await run_in_threadpool(agent.assess, claim)
+    message_id = message.get("messageId")
     return {
         "jsonrpc": "2.0",
         "id": rpc.get("id"),
@@ -114,7 +126,7 @@ async def a2a(request: Request) -> dict:
             "kind": "message",
             "role": "agent",
             # Derived from the request's messageId, so a repeat call gets an identical reply.
-            "messageId": str(uuid.uuid5(uuid.NAMESPACE_URL, str(message.get("messageId")))),
+            "messageId": str(uuid.uuid5(uuid.NAMESPACE_URL, message_id if isinstance(message_id, str) else "")),
             "parts": [{"kind": "data", "data": result}],
         },
     }
@@ -124,6 +136,6 @@ async def a2a(request: Request) -> dict:
 async def assess(request: Request) -> dict:
     try:
         payload = await request.json()
-    except ValueError:
+    except (ValueError, RecursionError):  # invalid or too deeply nested JSON
         payload = None  # the agent answers FAILED: "The request body must be a JSON object."
     return await run_in_threadpool(agent.assess, payload)

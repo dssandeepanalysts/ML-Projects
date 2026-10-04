@@ -37,7 +37,7 @@ End to end, for one claim:
 2. **Validate.** Missing fields, wrong types, unknown `loss.cause`, bad dates and personal data all return `FAILED` with a reason that names the field. Unknown optional fields are ignored.
 3. **Score.** Five deterministic rules fire or don't. Points are summed, capped at 100 and raised to the highest floor among the fired rules.
 4. **Confidence.** Computed from data availability only (100, 80 or 60); it never depends on the score.
-5. **Explain.** A template sentence is always built; it reproduces the dataset's `reasoning` column exactly. If a local LLM is available and at least one indicator fired, LangChain asks Ollama to reword **the facts only**. The output must pass eight guardrail checks or the template is used instead.
+5. **Explain.** A template sentence is always built; it reproduces the dataset's `reasoning` column exactly. If a local LLM is available and at least one indicator fired, LangChain asks Ollama to reword **the facts only**. The output must pass the guardrail checks in §3.3, within a hard time limit, or the template is used instead.
 6. **Self-check and respond.** Out-of-range values become `FAILED`, never a malformed `COMPLETED`. The agent is stateless and has no side effects, so Pega's retries are safe.
 
 **Why not a tool-calling (ReAct) agent?** The spec requires that every number and flag come from plain code (§7, §12.4), that repeat calls return identical results (AT-8), and that each call answer inside Pega's 15-second timeout. A local 3B model choosing tools would add nondeterminism, latency and an injection surface without improving the score. So this is an agent in the A2A sense: an autonomous service with a published Agent Card and skill. The LLM's job is limited to wording.
@@ -75,7 +75,7 @@ Configuration (all optional):
 |---|---|---|
 | `FRA_OLLAMA_MODEL` | `llama3.2` | Ollama model name |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama URL |
-| `FRA_LLM_TIMEOUT` | `8` | seconds before falling back to the template (Pega allows 15 s per attempt) |
+| `FRA_LLM_TIMEOUT` | `8` | total seconds one LLM explanation may take before the template is used (Pega allows 15 s per attempt) |
 | `FRA_USE_LLM` | `0` | server only: `1` turns on Ollama wording (the CLI uses it unless `--no-llm`) |
 | `FRA_API_TOKEN` | *(unset → all POSTs return 401)* | bearer token the caller must send |
 | `FRA_PUBLIC_URL` | `http://localhost:8000` | URL advertised in the Agent Card |
@@ -120,22 +120,22 @@ confidence  = round( (policy_c + history_c) / 2 ),  each component 100 if its da
 
 ### 3.2 Contract rules → `FAILED`
 
-The agent returns `FAILED` (with no score, confidence or flags) when any of these happen. The reason always names the offending field:
+The agent returns `FAILED` (with no score, confidence or flags) when any of these happen. For a contract violation the reason names the offending field; internal errors and self-check failures give a generic reason (spec §11). Every contract violation is also logged, by field name only:
 
 * a required field is missing, or has the wrong JSON type (`1` is not a boolean, `true` is not an integer)
 * `loss.cause` is not one of `COLLISION, THEFT, VANDALISM, FIRE, NATURAL, GLASS, ANIMAL, OTHER`
 * a date is not `YYYY-MM-DD`; `claim_id` is not `AC-nnnn`; `correlation_id` is not a UUID; a hash is not hex; a count is negative
-* personal or damage data appears anywhere in the payload (name, DOB, phone, email, address, make/model/year, photos, plain policy number or VIN, damage estimate or severity)
+* a key for personal or damage data appears anywhere in the payload, matched in any case style (`date_of_birth`, `dateOfBirth`, `DateOfBirth`): name, first/last name, date of birth, phone, email, address, vehicle make/model/year, photos, plain policy number or VIN, the damage agent's estimate, severity or confidence score
 * an unexpected exception occurs, or the self-check finds an out-of-range value
 
 ### 3.3 LLM-based reasoning: wording only, behind guardrails
 
 * **Input:** plain text: the cause of loss, the number of indicators, one line per fired indicator (the template sentence) and, if any data was missing, the incomplete-data sentence to copy at the end. The system prompt includes two worked examples. The LLM **never** receives `loss.description` or the hashes, so the 8 prompt-injection rows in the dataset cannot reach it. Those rows are still detected by a regex and logged as a warning.
-* **Settings:** `temperature=0`, `seed=42`, `num_predict=200`, 8-second timeout.
+* **Settings:** `temperature=0`, `seed=42`, `num_predict=200`, and an 8-second limit on the whole explanation (not just on each streamed chunk).
 * **Called only when at least one indicator fired.** A clean claim gets the spec's sentence verbatim.
-* **Output is rejected (and the template used instead) if it:** is shorter than 20 or longer than 800 characters; contains markup or a list; uses accusatory, judgemental or advisory words (*fraudulent, suspicious, unusual, warrants review, investigate, should…*); talks about the prompt itself (*key phrase, data note, input…*); misses the key phrase of a fired indicator; mentions an indicator that did not fire; states the wrong number of indicators; leaves out or invents the missing-data sentence; contains **any number not present in the facts** (which blocks invented scores or counts); contains a hash fragment; or repeats 6 or more consecutive words of the claimant's description.
-* Ollama down, model missing, timeout: all fall back to the template. Numbers and flags are identical either way.
-* **Real-model check (CI job `ollama-smoke`):** runs `llama3.2` on 15 flagged claims. The first run showed why the strict checks matter: 11 of 15 answers talked about the prompt ("…which is a key phrase") or judged the claim ("warrant further review"). A second run, with a new prompt, fixed that but showed the model miscounting ("Two indicators were found" when one fired) in 6 of 15 answers, so stated counts are now checked too. Every pattern seen is kept as a regression test. On GitHub's 4-core CPU runner each explanation took **5–12 s**, so with the 8 s timeout some calls fall back to the template; use a GPU or a smaller model (`llama3.2:1b`) if you want LLM wording on every claim.
+* **Output is rejected (and the template used instead) unless:** every fired indicator appears in its **exact template wording** (so each number stays attached to its own fact), the missing-data sentence appears word for word exactly when data was missing, and, once those sentences are removed, **only linking words remain** (*one, indicator, was, found, on, this, claim, and, also…* plus the cause of loss). That closed-vocabulary check is what stops negated indicators, swapped numbers, invented facts, a wrong cause of loss and scores. Further checks reject: under 20 or over 800 characters; markup or lists; accusatory, judgemental or advisory wording, matched by word stem (*fraud…, suspect…, fake…, investigate, must, deny, reject…*; only "fraud indicator" is allowed); talk about the prompt itself; a wrong stated number of indicators ("Two", "both", "several"…); a number not in the facts; a hash fragment; 6 or more consecutive words from the claimant's description.
+* Ollama down, model missing, too slow: all fall back to the template. Numbers and flags are identical either way.
+* **Real-model check (CI job `ollama-smoke`):** runs `llama3.2` on 15 flagged claims. The first run showed why the strict checks matter: 11 of 15 answers talked about the prompt ("…which is a key phrase") or judged the claim ("warrant further review"). A second run, with a new prompt, fixed that but showed the model miscounting ("Two indicators were found" when one fired) in 6 of 15 answers, so stated counts are now checked too. Every pattern seen is kept as a regression test, and the 15 correct answers from the latest run are kept as tests that must keep passing. On GitHub's 4-core CPU runner each explanation took **3–9 s** (17 s on a cold start), so with the 8 s limit some calls fall back to the template; use a GPU or a smaller model (`llama3.2:1b`) if you want LLM wording on every claim.
 
 ### 3.4 How good are the rules? (`python evaluate.py`)
 
@@ -164,11 +164,11 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 | Phase | Build | Working artifact | Exit criteria (command) |
 |---|---|---|---|
 | **0. Setup** | venv, `requirements.txt`, data in `data/` | importable package | `python -c "import fra_agent"` |
-| **1. Ingestion & contract** | `row_to_request`, `read_csv_rows`, `validate_request`, `FAILED` responses | CLI that rejects bad payloads with the field name | `python -m pytest -k "invalid or personal or missing or non_object or unknown"` · `python fra_agent.py --no-llm --request examples/request_missing_field.json` |
-| **2. Rule engine & confidence** | `fired_indicators`, `risk_score`, `compute_confidence`, self-check | deterministic scorer | `python -m pytest -k "acceptance or confidence or boundaries or at8"`: AT-1…AT-8 exact |
-| **3. Reasoning (template, then LLM)** | `template_reasoning`; LangChain prompt → `ChatOllama`; `narrative_problems` guardrails; fallback | explanations for every claim, with or without Ollama | `python -m pytest -k "llm or wording"` (fake LLM, no Ollama needed) · `python fra_agent.py --request examples/request_all_indicators.json` (real Ollama) |
-| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 58 passed · `python evaluate.py` → 1500/1500 identical · CI runs both on every PR, plus the real-model smoke job |
-| **5. A2A service** | `server.py`: Agent Card, bearer auth, JSON-RPC `message/send`, REST `/v1/assess`, `/health` | HTTP service Pega can call | `python -m pytest tests/test_server.py` · `uvicorn server:app` + the curl calls below |
+| **1. Ingestion & contract** | `row_to_request`, `read_csv_rows`, `validate_request`, `FAILED` responses | CLI that rejects bad payloads with the field name | `python -m pytest -k "invalid or personal or missing_field or non_object or unknown or nested"` (26 tests) · `python fra_agent.py --no-llm --request examples/request_missing_field.json` |
+| **2. Rule engine & confidence** | `fired_indicators`, `risk_score`, `compute_confidence`, self-check | deterministic scorer | `python -m pytest -k "acceptance or confidence or boundaries or at7 or at8 or out_of_range or internal_error"` (21 tests): AT-1…AT-8 exact |
+| **3. Reasoning (template, then LLM)** | `template_reasoning`; LangChain prompt → `ChatOllama`; `narrative_problems` guardrails; fallback | explanations for every claim, with or without Ollama | `python -m pytest -k "llm or llama or wording or missing_data"` (49 tests, fake LLM, no Ollama needed) · `python fra_agent.py --request examples/request_all_indicators.json` (real Ollama) |
+| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 109 passed · `python evaluate.py` → 1500/1500 identical (exits non-zero otherwise) · CI runs both on every PR, plus the real-model smoke job |
+| **5. A2A service** | `server.py`: Agent Card, bearer auth, JSON-RPC `message/send`, REST `/v1/assess`, `/health` | HTTP service Pega can call | `python -m pytest tests/test_server.py` (12 tests) · `uvicorn server:app` + the curl calls below |
 
 **Before production** (out of scope for this build, per spec §13 and §15): validate real OAuth 2.0 JWTs instead of a static token; confirm the A2A version and DataPart shape with Pega (O-1); review LLM wording quality on a sample with adjusters (target: zero factual errors, F-M09); start collecting SIU-confirmed outcomes so a model can be trained and tested later.
 
@@ -178,11 +178,11 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 
 | File | Lines | What it is |
 |---|---|---|
-| [`fra_agent.py`](fra_agent.py) | ~500 | **The agent**: contract validation, rule engine, confidence, template and LLM reasoning with guardrails, self-check, CLI. Self-contained; this is the only file needed to score a claim. |
-| [`server.py`](server.py) | ~130 | A2A / REST front door (FastAPI): Agent Card, bearer auth, JSON-RPC `message/send` |
+| [`fra_agent.py`](fra_agent.py) | ~600 | **The agent**: contract validation, rule engine, confidence, template and LLM reasoning with guardrails, self-check, CLI. Self-contained; this is the only file needed to score a claim. |
+| [`server.py`](server.py) | ~140 | A2A / REST front door (FastAPI): Agent Card, bearer auth, JSON-RPC `message/send` |
 | [`evaluate.py`](evaluate.py) | ~100 | Batch evaluation and the shadow scikit-learn challenger |
-| [`tests/`](tests) | ~330 | 58 pytest tests: acceptance AT-1…AT-8, boundaries, validation, 1,500-row reproduction, LLM guardrails (fake model), server |
-| [`../.github/workflows/fraud-risk-agent.yml`](../.github/workflows/fraud-risk-agent.yml) | ~70 | CI: tests + evaluation, and the `ollama-smoke` job with the real model |
+| [`tests/`](tests) | ~490 | 109 pytest tests: acceptance AT-1…AT-8, boundaries, validation, self-check, log hygiene, 1,500-row reproduction, LLM guardrails (fake model, real llama3.2 outputs, deadline), server |
+| [`../.github/workflows/fraud-risk-agent.yml`](../.github/workflows/fraud-risk-agent.yml) | ~80 | CI: tests + evaluation, and the `ollama-smoke` job with the real model |
 | [`examples/`](examples) | – | Request payloads: clean, duplicate, all indicators, missing field |
 | [`data/`](data) | – | Synthetic claims CSV and data dictionary |
 
@@ -235,7 +235,7 @@ Each of these was needed because the source files are silent or disagree:
 2. **`claim_id` is echoed in the response.** Spec §5.2 and the data dictionary say to echo it, but the §6.2 response table lists only five fields. If Pega's schema rejects extra properties, delete the one line in `FraudRiskAgent.assess` that adds it.
 3. **`FAILED` omits `risk_flags`.** Spec §6.2 says flags are "always" present, while §6.2.1 and AT-7 say to omit them on failure. The more specific rule and the acceptance test are followed.
 4. **Risk bands** come from Blueprint v1.5 governance defaults (30 / 60 / 80), not the PDF's 40 / 70. Bands are Pega's job; they appear here only in the evaluation.
-5. **Forbidden-field names** are not specified, so a deny-list of likely key names is used (`FORBIDDEN_KEYS`). A future optional field that happens to use one of those names (e.g. `model`) would be rejected; edit the list if Pega adds one.
+5. **Forbidden-field names** are not specified, so a deny-list of likely key names is used (`FORBIDDEN_KEYS`), compared after normalising case and separators, and including the Blueprint's own property names (`PolicyNumber`, `DateOfBirth`, `ConfidenceScore`). A future optional field that happens to use one of those names (e.g. `model`) would be rejected; edit the list if Pega adds one. `correlation_id` must be a canonical UUID v4 and `claim_id` uses ASCII digits only.
 6. **Formats.** `AC-nnnn` means `AC-` followed by 4 or more digits. Hashes must be hex with 16 or more characters (SHA-256 gives 64, per O-2). Date ordering and description length (V-02, V-19) are validated by Pega, not re-checked here.
 7. **`LATE_REPORTED` wording** quotes the day gap computed from the two dates, with `LateReportDays = 30`. The flag itself always comes from Pega's boolean.
 8. **Authentication.** A static bearer token (`FRA_API_TOKEN`) stands in for OAuth 2.0 client credentials. A2A is implemented as protocol 0.3 JSON-RPC `message/send` with a DataPart (open item O-1). The business payload is decoupled from the envelope, so either can change independently.

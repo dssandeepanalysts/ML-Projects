@@ -33,7 +33,7 @@ NUMERIC = ["vehicle_policy_mismatch", "potential_duplicate", "claims_last_24_mon
            "days_since_policy_start", "late_reported"]
 
 
-def contract_check(df: pd.DataFrame) -> pd.Series:
+def contract_check(df: pd.DataFrame) -> tuple[pd.Series, bool]:
     agent = FraudRiskAgent()  # template reasoning: deterministic
     results = [agent.assess(row_to_request(row)) for row in df.to_dict("records")]
     same = [
@@ -46,7 +46,7 @@ def contract_check(df: pd.DataFrame) -> pd.Series:
     ]
     print(f"Contract reproduction: {sum(same)}/{len(df)} rows identical "
           "(risk_score, confidence, risk_flags, reasoning)")
-    return pd.Series([r.get("risk_score") for r in results], index=df.index)
+    return pd.Series([r.get("risk_score") for r in results], index=df.index), all(same)
 
 
 def detection_metrics(y: pd.Series, score: pd.Series) -> None:
@@ -87,7 +87,9 @@ def main() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
     df = pd.read_csv(args.csv)
-    rule_score = contract_check(df)
+    rule_score, reproduced = contract_check(df)
+    if not reproduced:
+        raise SystemExit("Contract reproduction failed: the agent no longer matches the reference rows.")
     detection_metrics(df.fraud_confirmed, rule_score)
     shadow_challenger(df, rule_score)
 
