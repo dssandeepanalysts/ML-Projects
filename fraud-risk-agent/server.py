@@ -11,8 +11,8 @@ Endpoints
     POST /v1/assess                Plain REST binding of the same payload (Connect-REST fallback)
     GET  /health                   Liveness check
 
-Environment: FRA_API_TOKEN (required for POSTs), FRA_PUBLIC_URL, FRA_USE_LLM=0 to disable
-Ollama, plus the FRA_OLLAMA_MODEL / OLLAMA_HOST / FRA_LLM_TIMEOUT settings in fra_agent.py.
+Environment: FRA_API_TOKEN (required for POSTs), FRA_PUBLIC_URL, FRA_USE_LLM=1 to turn on
+Ollama wording (off by default: template replies in ~1 ms, a CPU-only LLM adds seconds), plus the FRA_OLLAMA_MODEL / OLLAMA_HOST / FRA_LLM_TIMEOUT settings in fra_agent.py.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ logging.basicConfig(level=os.getenv("FRA_LOG_LEVEL", "INFO"), format="%(asctime)
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one log line per claim is enough
 log = logging.getLogger("fra.server")
 
-agent = FraudRiskAgent(llm=build_ollama_llm() if os.getenv("FRA_USE_LLM", "1") != "0" else None)
+agent = FraudRiskAgent(llm=build_ollama_llm() if os.getenv("FRA_USE_LLM", "0") == "1" else None)
 app = FastAPI(title="Fraud Risk Agent", version=AGENT_VERSION)
 
 if not os.getenv("FRA_API_TOKEN"):

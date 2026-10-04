@@ -76,7 +76,7 @@ Configuration (all optional):
 | `FRA_OLLAMA_MODEL` | `llama3.2` | Ollama model name |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama URL |
 | `FRA_LLM_TIMEOUT` | `8` | seconds before falling back to the template (Pega allows 15 s per attempt) |
-| `FRA_USE_LLM` | `1` | server only: `0` gives template-only wording |
+| `FRA_USE_LLM` | `0` | server only: `1` turns on Ollama wording (the CLI uses it unless `--no-llm`) |
 | `FRA_API_TOKEN` | *(unset → all POSTs return 401)* | bearer token the caller must send |
 | `FRA_PUBLIC_URL` | `http://localhost:8000` | URL advertised in the Agent Card |
 | `FRA_LOG_LEVEL` | `INFO` | log level |
@@ -202,7 +202,7 @@ python evaluate.py
 
 # Serve over A2A / REST
 export FRA_API_TOKEN=change-me
-uvicorn server:app --port 8000
+uvicorn server:app --port 8000          # template wording; FRA_USE_LLM=1 uvicorn ... to use Ollama
 curl -s localhost:8000/.well-known/agent.json
 curl -s -X POST localhost:8000/v1/assess -H "Authorization: Bearer $FRA_API_TOKEN" \
      -H "Content-Type: application/json" -d @examples/request_duplicate.json
@@ -239,5 +239,5 @@ Each of these was needed because the source files are silent or disagree:
 6. **Formats.** `AC-nnnn` means `AC-` followed by 4 or more digits. Hashes must be hex with 16 or more characters (SHA-256 gives 64, per O-2). Date ordering and description length (V-02, V-19) are validated by Pega, not re-checked here.
 7. **`LATE_REPORTED` wording** quotes the day gap computed from the two dates, with `LateReportDays = 30`. The flag itself always comes from Pega's boolean.
 8. **Authentication.** A static bearer token (`FRA_API_TOKEN`) stands in for OAuth 2.0 client credentials. A2A is implemented as protocol 0.3 JSON-RPC `message/send` with a DataPart (open item O-1). The business payload is decoupled from the envelope, so either can change independently.
-9. **LLM.** The default is `llama3.2` (3B); any Ollama chat model works. With `temperature=0` and a fixed seed, wording repeats on the same model and hardware. Byte-identical repeat responses (AT-8) are strictly guaranteed in template mode (`--no-llm` / `FRA_USE_LLM=0`), while scores and flags are identical in every mode. On CPU-only hardware the LLM adds 5–12 s per flagged claim, above the spec's 5 s target for a normal request (§10.1); the template-only mode meets it easily.
+9. **LLM.** The default is `llama3.2` (3B); any Ollama chat model works. With `temperature=0` and a fixed seed, wording repeats on the same model and hardware. Byte-identical repeat responses (AT-8) are strictly guaranteed in template mode (`--no-llm`, and the server default), while scores and flags are identical in every mode. On CPU-only hardware the LLM adds 5–12 s per flagged claim, above the spec's 5 s target for a normal request (§10.1); the template-only mode meets it easily, so the server runs template-only unless `FRA_USE_LLM=1` (e.g. on a GPU host).
 10. **Labels are synthetic.** `fraud_confirmed` is generated data, so the evaluation numbers show the method, not real-world performance.
