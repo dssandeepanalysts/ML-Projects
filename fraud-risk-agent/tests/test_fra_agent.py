@@ -4,13 +4,14 @@ No Ollama needed: the LLM is replaced by a RunnableLambda that returns canned te
 """
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessageChunk
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnableGenerator, RunnableLambda
 
 import fra_agent
 from fra_agent import INDICATORS, FraudRiskAgent, fired_indicators, narrative_problems, read_csv_rows, row_to_request
@@ -114,6 +115,8 @@ def test_reasoning_wording(make_request):
         ({"claim_id": "AC-\u0661\u0660\u0660\u0661"}, "claim_id"),  # non-ASCII digits
         ({"correlation_id": "00000000-0000-0000-0000-000000000000"}, "correlation_id"),  # not a v4 UUID
         ({"correlation_id": "3f6c1b0a-7e2d-4c91-9a08-1d5e6f2b8c41\n"}, "correlation_id"),
+        ({"loss__date": "20260920"}, "loss.date"),  # ISO basic format: fromisoformat would accept it
+        ({"loss__date": "2026-W38-7"}, "loss.date"),
     ],
 )
 def test_invalid_fields_fail(make_request, changes, field):
@@ -246,6 +249,7 @@ def test_bad_or_missing_llm_text_falls_back_to_template(make_request, reply):
 # Texts that pass the obvious checks but would mislead an adjuster (found in review).
 LATE_AND_CLAIMS = {"claim_history__late_reported": True, "loss__date": "2026-08-10", "claim_history__claims_last_24_months": 3}
 POLICY_DOWN = {"policy_data_available": False, **DUPLICATE}
+NOTE = "Policy details could not be verified with the policy service, so this assessment is based on incomplete data."
 
 
 @pytest.mark.parametrize(
@@ -307,12 +311,43 @@ POLICY_DOWN = {"policy_data_available": False, **DUPLICATE}
             "so this assessment is based on incomplete data. In addition, " + DUP + ".",
             "missing-data sentence wrong",
         ),
+        # Final review round
+        (  # ... the same, with the sentence repeated at the end as the prompt asks
+            POLICY_DOWN,
+            "One indicator was found on this collision claim: " + NOTE[0].lower() + NOTE[1:] + " In addition, " + DUP + ". " + NOTE,
+            "missing-data sentence wrong",
+        ),
+        (POLICY_DOWN, OPENER + DUP + ", and " + NOTE[0].lower() + NOTE[1:], "missing-data sentence wrong"),  # not its own sentence
+        (  # a bare "as" inventing a cause between two independent facts
+            {"vehicle_policy_mismatch": True, "claim_history__days_since_policy_start": 5},
+            "Two indicators were found on this collision claim. As the loss occurred 5 days after the policy start date, "
+            "the claimed vehicle does not match any vehicle listed on the policy.",
+            "adds words beyond the facts",
+        ),
+        ({**DUPLICATE, "loss__cause": "OTHER"}, "One indicator was found on this other claim: " + DUP + ".", "adds words beyond the facts"),
     ],
 )
 def test_misleading_llm_text_is_rejected(make_request, changes, reply, problem):
     request = make_request(**changes)
     assert problem in narrative_problems(reply, request, fired_indicators(request))
     assert FraudRiskAgent(llm=fake_llm(reply)).assess(request) == AGENT.assess(request)
+
+
+@pytest.mark.parametrize(
+    "changes, reply",
+    [
+        (  # "as well as" is still a fine joiner
+            {"vehicle_policy_mismatch": True, **DUPLICATE},
+            "Two indicators were found on this collision claim: the claimed vehicle does not match any vehicle listed on "
+            "the policy, as well as " + DUP + ".",
+        ),
+        ({**DUPLICATE, "loss__cause": "OTHER"}, "One indicator was found on this claim: " + DUP + ". No other indicators were found."),
+        (POLICY_DOWN, OPENER + DUP + ". " + NOTE),
+    ],
+)
+def test_correct_llm_text_is_used(make_request, changes, reply):
+    result = FraudRiskAgent(llm=fake_llm(reply)).assess(make_request(**changes))
+    assert result["reasoning"] == reply
 
 
 def test_template_wording_passes_the_llm_checks():
@@ -377,6 +412,27 @@ def test_slow_llm_falls_back_within_the_deadline(make_request, monkeypatch):
     result = FraudRiskAgent(llm=RunnableLambda(lambda _: time.sleep(2) or GOOD_REPLY)).assess(request)
     assert time.perf_counter() - started < 1.5
     assert result == AGENT.assess(request)
+
+
+def test_stream_is_closed_at_the_deadline(make_request, monkeypatch):
+    monkeypatch.setattr(fra_agent, "LLM_TIMEOUT", 0.2)
+    words, read, closed = GOOD_REPLY.split() * 5, [], threading.Event()
+
+    def slow_stream(inputs):
+        for _ in inputs:
+            pass
+        try:
+            for word in words:
+                time.sleep(0.05)
+                read.append(word)
+                yield word + " "
+        finally:
+            closed.set()
+
+    request = make_request(**DUPLICATE)
+    assert FraudRiskAgent(llm=RunnableGenerator(slow_stream)).assess(request) == AGENT.assess(request)
+    assert closed.wait(1)  # the worker dropped the stream soon after the deadline ...
+    assert len(read) < len(words)  # ... instead of reading it to the end
 
 
 def test_timed_out_queued_call_never_reaches_the_model(make_request, monkeypatch):

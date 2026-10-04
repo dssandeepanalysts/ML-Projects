@@ -49,7 +49,7 @@ End to end, for one claim:
 | Component | Version tested | Free / OSS | Used for | Where |
 |---|---|---|---|---|
 | Python | 3.11 (needs 3.10+) | ✓ | runtime | all |
-| `langchain-core` | 1.6 | ✓ MIT | prompt template, runnable chain, output parser | `fra_agent.py` |
+| `langchain-core` | 1.6 | ✓ MIT | chat prompt template, streaming interface the agent drives | `fra_agent.py` |
 | `langchain-ollama` | 1.1 | ✓ MIT | `ChatOllama` client for the local model | `fra_agent.py` |
 | **Ollama** + `llama3.2` (3B) | any recent release | ✓ MIT / Llama 3.2 licence | local LLM for explanation wording (optional) | runtime |
 | `fastapi` + `uvicorn` | 0.142 / 0.50 | ✓ MIT / BSD | A2A JSON-RPC and REST endpoints, Agent Card | `server.py` |
@@ -164,10 +164,10 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 | Phase | Build | Working artifact | Exit criteria (command) |
 |---|---|---|---|
 | **0. Setup** | venv, `requirements.txt`, data in `data/` | importable package | `python -c "import fra_agent"` |
-| **1. Ingestion & contract** | `row_to_request`, `read_csv_rows`, `validate_request`, `FAILED` responses | CLI that rejects bad payloads with the field name | `python -m pytest -k "invalid or personal or missing_field or non_object or unknown or nested"` (29 tests) · `python fra_agent.py --no-llm --request examples/request_missing_field.json` |
+| **1. Ingestion & contract** | `row_to_request`, `read_csv_rows`, `validate_request`, `FAILED` responses | CLI that rejects bad payloads with the field name | `python -m pytest -k "invalid or personal or missing_field or non_object or unknown or nested"` (31 tests) · `python fra_agent.py --no-llm --request examples/request_missing_field.json` |
 | **2. Rule engine & confidence** | `fired_indicators`, `risk_score`, `compute_confidence`, self-check | deterministic scorer | `python -m pytest -k "acceptance or confidence or boundaries or at7 or at8 or out_of_range or internal_error"` (21 tests): AT-1…AT-8 exact |
-| **3. Reasoning (template, then LLM)** | `template_reasoning`; LangChain prompt → `ChatOllama`; `narrative_problems` guardrails; fallback | explanations for every claim, with or without Ollama | `python -m pytest -k "llm or llama or wording or missing_data or template_wording or chunks or queued"` (64 tests, fake LLM, no Ollama needed) · `python fra_agent.py --request examples/request_all_indicators.json` (real Ollama) |
-| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 127 passed · `python evaluate.py` → 1500/1500 identical (exits non-zero otherwise) · CI runs both on every PR, plus the real-model smoke job |
+| **3. Reasoning (template, then LLM)** | `template_reasoning`; LangChain prompt → `ChatOllama`; `narrative_problems` guardrails; fallback | explanations for every claim, with or without Ollama | `python -m pytest -k "llm or llama or wording or missing_data or template_wording or chunks or queued or stream"` (72 tests, fake LLM, no Ollama needed) · `python fra_agent.py --request examples/request_all_indicators.json` (real Ollama) |
+| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 137 passed · `python evaluate.py` → 1500/1500 identical (exits non-zero otherwise) · CI runs both on every PR, plus the real-model smoke job |
 | **5. A2A service** | `server.py`: Agent Card, bearer auth, JSON-RPC `message/send`, REST `/v1/assess`, `/health` | HTTP service Pega can call | `python -m pytest tests/test_server.py` (12 tests) · `uvicorn server:app` + the curl calls below |
 
 **Before production** (out of scope for this build, per spec §13 and §15): validate real OAuth 2.0 JWTs instead of a static token; confirm the A2A version and DataPart shape with Pega (O-1); review LLM wording quality on a sample with adjusters (target: zero factual errors, F-M09); start collecting SIU-confirmed outcomes so a model can be trained and tested later.
@@ -178,10 +178,10 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 
 | File | Lines | What it is |
 |---|---|---|
-| [`fra_agent.py`](fra_agent.py) | ~630 | **The agent**: contract validation, rule engine, confidence, template and LLM reasoning with guardrails, self-check, CLI. Self-contained; this is the only file needed to score a claim. |
+| [`fra_agent.py`](fra_agent.py) | ~640 | **The agent**: contract validation, rule engine, confidence, template and LLM reasoning with guardrails, self-check, CLI. Self-contained; this is the only file needed to score a claim. |
 | [`server.py`](server.py) | ~140 | A2A / REST front door (FastAPI): Agent Card, bearer auth, JSON-RPC `message/send` |
 | [`evaluate.py`](evaluate.py) | ~100 | Batch evaluation and the shadow scikit-learn challenger |
-| [`tests/`](tests) | ~560 | 127 pytest tests: acceptance AT-1…AT-8, boundaries, validation, self-check, log hygiene, 1,500-row reproduction, LLM guardrails (fake model, real llama3.2 outputs, deadline), server |
+| [`tests/`](tests) | ~600 | 137 pytest tests: acceptance AT-1…AT-8, boundaries, validation, self-check, log hygiene, 1,500-row reproduction, LLM guardrails (fake model, real llama3.2 outputs, deadline), server |
 | [`../.github/workflows/fraud-risk-agent.yml`](../.github/workflows/fraud-risk-agent.yml) | ~80 | CI: tests + evaluation, and the `ollama-smoke` job with the real model |
 | [`examples/`](examples) | – | Request payloads: clean, duplicate, all indicators, missing field |
 | [`data/`](data) | – | Synthetic claims CSV and data dictionary |
@@ -239,5 +239,5 @@ Each of these was needed because the source files are silent or disagree:
 6. **Formats.** `AC-nnnn` means `AC-` followed by 4 or more digits. Hashes must be hex with 16 or more characters (SHA-256 gives 64, per O-2). Date ordering and description length (V-02, V-19) are validated by Pega, not re-checked here.
 7. **`LATE_REPORTED` wording** quotes the day gap computed from the two dates, with `LateReportDays = 30`. The flag itself always comes from Pega's boolean.
 8. **Authentication.** A static bearer token (`FRA_API_TOKEN`) stands in for OAuth 2.0 client credentials. A2A is implemented as protocol 0.3 JSON-RPC `message/send` with a DataPart (open item O-1). The business payload is decoupled from the envelope, so either can change independently.
-9. **LLM.** The default is `llama3.2` (3B); any Ollama chat model works. With `temperature=0` and a fixed seed, wording repeats on the same model and hardware. Byte-identical repeat responses (AT-8) are strictly guaranteed in template mode (`--no-llm`, and the server default), while scores and flags are identical in every mode. On CPU-only hardware the LLM adds 5–12 s per flagged claim, above the spec's 5 s target for a normal request (§10.1); the template-only mode meets it easily, so the server runs template-only unless `FRA_USE_LLM=1` (e.g. on a GPU host).
+9. **LLM.** The default is `llama3.2` (3B); any Ollama chat model works. With `temperature=0` and a fixed seed, wording repeats on the same model and hardware. Byte-identical repeat responses (AT-8) are strictly guaranteed in template mode (`--no-llm`, and the server default), while scores and flags are identical in every mode. On CPU-only hardware the model takes about 3–9 s per flagged claim (more on a cold start); the agent caps this at `FRA_LLM_TIMEOUT` (8 s) and then uses the template. That is above the spec's 5 s target for a normal request (§10.1), while the template-only mode meets it easily, so the server runs template-only unless `FRA_USE_LLM=1` (e.g. on a GPU host).
 10. **Labels are synthetic.** `fraud_confirmed` is generated data, so the evaluation numbers show the method, not real-world performance.

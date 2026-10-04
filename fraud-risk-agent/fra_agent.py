@@ -373,7 +373,9 @@ LIST_ITEM = re.compile(r"^\s*([-\u2022]|\d+[.)])\s", re.MULTILINE)
 PLAIN_PROSE = re.compile(r"[A-Za-z0-9 ,.;:-]*")
 # Closed structure: [opener] + the exact indicator sentences + [no other indicators were found] +
 # [missing-data sentence]. Once those are removed only these joining words may remain.
-LINKING_WORDS = {"and", "also", "additionally", "furthermore", "moreover", "in", "addition", "while", "as", "well"}
+LINKING_WORDS = {"and", "also", "additionally", "furthermore", "moreover", "while"}
+# Multi-word joiners; a bare "as" would let the model invent a cause ("As the loss occurred ...").
+LINKING_PHRASES = re.compile(r"\b(?:as well as|as well|in addition)\b")
 NO_OTHER_INDICATORS = re.compile(r"no other indicators? (?:was|were) found", re.IGNORECASE)
 
 # Total time allowed for one LLM explanation; Pega allows 15 s per attempt (spec s10.1).
@@ -405,19 +407,20 @@ def _opener(req: dict, fired: list[str]) -> re.Pattern:
     """ "One indicator was found on this theft claim": the right count, and the cause only here."""
     n = len(fired)
     counts = ["one", "an", "a"] if n == 1 else [COUNT_WORDS[n].lower()] + (["both"] if n == 2 else [])
-    cause = re.escape(req["loss"]["cause"].lower())
-    return re.compile(
-        rf"^(?:{'|'.join(counts)}) indicators? (?:was|were) (?:found|identified)(?: (?:on|for|in) this {cause} claim)?"
-    )
+    cause = req["loss"]["cause"].lower()
+    slot = "this claim" if cause == "other" else f"this {re.escape(cause)} claim"  # not "this other claim"
+    return re.compile(rf"^(?:{'|'.join(counts)}) indicators? (?:was|were) (?:found|identified)(?: (?:on|for|in) {slot})?")
 
 
 def _unexplained_words(text: str, req: dict, fired: list[str]) -> list[str]:
     """Words left after removing the opener, the exact facts and "no other indicators were found"."""
     rest = _opener(req, fired).sub(" ", " ".join(text.lower().split()), count=1)
-    for phrase in [indicator_phrase(code, req) for code in fired] + [data_note(req)]:
-        if phrase:
-            rest = rest.replace(phrase.lower(), " ")
-    rest = NO_OTHER_INDICATORS.sub(" ", rest)
+    note = data_note(req).lower()
+    if note and rest.endswith(note):
+        rest = rest[: -len(note)]  # only the final copy is explained; any other copy is extra words
+    for phrase in [indicator_phrase(code, req) for code in fired]:
+        rest = rest.replace(phrase.lower(), " ")
+    rest = LINKING_PHRASES.sub(" ", NO_OTHER_INDICATORS.sub(" ", rest))
     return [word for word in re.findall(r"[^\W_]+", rest) if word not in LINKING_WORDS]
 
 
@@ -451,7 +454,7 @@ def narrative_problems(raw: str, req: dict, fired: list[str]) -> list[str]:
     # The missing-data sentence exactly when data was missing, as its own final sentence (so it
     # cannot pose as an indicator); never an invented one.
     note = data_note(req).lower()
-    if note and not (lowered.endswith(note) and lowered[: -len(note)].rstrip().endswith(".")):
+    if note and (lowered.count(note) != 1 or not (lowered.endswith(note) and lowered[: -len(note)].rstrip().endswith("."))):
         problems.append("missing-data sentence wrong")
     if not note and "could not be" in lowered:
         problems.append("missing-data sentence wrong")
@@ -487,7 +490,8 @@ def _generate(llm, facts: str, stop: threading.Event) -> str:
 
 def llm_reasoning(llm, req: dict, fired: list[str]) -> str | None:
     """Ask the LLM to reword the template facts. Returns None when the text cannot be used."""
-    lines = [f"Cause of loss: {req['loss']['cause'].lower()}", f"Number of indicators: {len(fired)}"]
+    cause = req["loss"]["cause"].lower()
+    lines = ([] if cause == "other" else [f"Cause of loss: {cause}"]) + [f"Number of indicators: {len(fired)}"]
     lines += [f"- {indicator_phrase(code, req)}" for code in fired]
     if data_note(req):
         lines.append(f"Final sentence: {data_note(req)}")
