@@ -1,7 +1,10 @@
 """Phase 5 tests: A2A Agent Card, bearer auth, JSON-RPC message/send and the REST binding."""
+import asyncio
+
 import pytest
 from conftest import build_request
 from fastapi.testclient import TestClient
+from langchain_core.runnables import RunnableLambda
 
 import server
 from fra_agent import FraudRiskAgent
@@ -84,3 +87,24 @@ def test_unexpected_server_error_still_returns_json(monkeypatch):  # spec s11, i
     rest = client.post("/v1/assess", json=build_request(), headers=AUTH)
     assert (rest.status_code, rest.json()["status"]) == (500, "FAILED")
     assert client.post("/a2a", json=rpc(build_request()), headers=AUTH).json()["error"]["code"] == -32603
+
+
+def test_health_never_waits_for_the_assessment_thread_pool():
+    assert asyncio.iscoroutinefunction(server.health)  # runs on the event loop, not in a pool thread
+
+
+def test_request_that_waited_too_long_gets_the_template(client, monkeypatch):
+    # Pega allows 15 s: a request that queued past the budget must not also wait for the LLM.
+    reply = ("One indicator was found on this collision claim: a potential duplicate of this claim "
+             "was already flagged against the same policy and vehicle.")
+    calls = []
+    monkeypatch.setattr(server, "agent", FraudRiskAgent(llm=RunnableLambda(lambda _: calls.append(1) or reply)))
+    claim = build_request(claim_history__potential_duplicate=True)
+
+    monkeypatch.setattr(server, "QUEUE_BUDGET", 0.0)
+    late = client.post("/v1/assess", json=claim, headers=AUTH).json()
+    assert calls == [] and late["risk_score"] == 70 and late["reasoning"] != reply
+
+    monkeypatch.setattr(server, "QUEUE_BUDGET", 60.0)
+    on_time = client.post("/v1/assess", json=claim, headers=AUTH).json()
+    assert calls == [1] and on_time["reasoning"] == reply

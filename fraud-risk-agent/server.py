@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import time
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -26,7 +27,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.concurrency import run_in_threadpool
 
-from fra_agent import AGENT_VERSION, FraudRiskAgent, build_ollama_llm, failed
+from fra_agent import AGENT_VERSION, LLM_TIMEOUT, FraudRiskAgent, build_ollama_llm, failed
 
 logging.basicConfig(level=os.getenv("FRA_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one log line per claim is enough
@@ -68,7 +69,7 @@ AGENT_CARD = {
 bearer = HTTPBearer(auto_error=False)
 
 
-def require_token(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> None:
+async def require_token(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> None:
     """Reject unauthenticated calls outright (spec s4). Production: validate the OAuth 2.0 JWT instead."""
     expected = os.getenv("FRA_API_TOKEN")
     # Compare bytes: compare_digest raises on non-ASCII str, which would turn a bad token into a 500.
@@ -91,7 +92,7 @@ async def internal_error(request: Request, exc: Exception) -> JSONResponse:
 
 
 @app.get("/health")
-def health() -> dict:
+async def health() -> dict:  # async: never queues behind assessments in the thread pool
     """Liveness for Docker/Kubernetes. Stays "ok" when Ollama is down: the template still answers."""
     return {"status": "ok", "version": AGENT_VERSION, "llm_wording": "on" if agent.llm is not None else "off"}
 
@@ -102,8 +103,22 @@ def agent_card() -> dict:
     return AGENT_CARD
 
 
+# Pega allows 15 s per attempt. A request that waited this long for a free worker thread is
+# answered with the template (same score and flags), so the LLM cannot push it past 15 s.
+QUEUE_BUDGET = max(0.0, 14.0 - LLM_TIMEOUT)
+template_agent = FraudRiskAgent()
+if agent.llm is not None and QUEUE_BUDGET < 2:
+    log.warning("FRA_LLM_TIMEOUT=%.0f s leaves %.0f s of Pega's 15 s for queueing: most replies will use the "
+                "template. Keep it at 10 s or less.", LLM_TIMEOUT, QUEUE_BUDGET)
+
+
+def _assess(payload, arrived: float) -> dict:
+    return (template_agent if time.monotonic() - arrived > QUEUE_BUDGET else agent).assess(payload)
+
+
 @app.post("/a2a", dependencies=[Depends(require_token)])
 async def a2a(request: Request) -> dict:
+    arrived = time.monotonic()
     try:
         rpc = await request.json()
     except (ValueError, RecursionError):  # invalid or too deeply nested JSON
@@ -118,7 +133,7 @@ async def a2a(request: Request) -> dict:
     except (KeyError, TypeError, AttributeError, StopIteration):
         return rpc_error(rpc.get("id"), -32602, "Invalid params: expected a message with a data part")
 
-    result = await run_in_threadpool(agent.assess, claim)
+    result = await run_in_threadpool(_assess, claim, arrived)
     message_id = message.get("messageId")
     return {
         "jsonrpc": "2.0",
@@ -135,8 +150,9 @@ async def a2a(request: Request) -> dict:
 
 @app.post("/v1/assess", dependencies=[Depends(require_token)])
 async def assess(request: Request) -> dict:
+    arrived = time.monotonic()
     try:
         payload = await request.json()
     except (ValueError, RecursionError):  # invalid or too deeply nested JSON
         payload = None  # the agent answers FAILED: "The request body must be a JSON object."
-    return await run_in_threadpool(agent.assess, payload)
+    return await run_in_threadpool(_assess, payload, arrived)

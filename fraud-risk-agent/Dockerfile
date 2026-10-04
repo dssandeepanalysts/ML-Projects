@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Fraud Risk Agent: A2A / REST service (server.py). Template wording by default;
 # set FRA_USE_LLM=1 and OLLAMA_HOST to reword explanations with a local Ollama model.
 FROM python:3.11-slim
@@ -9,7 +10,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements-server.txt .
-RUN pip install -r requirements-server.txt
+# Behind a TLS-intercepting proxy, pass its CA without baking it into the image:
+#   docker build --secret id=pip_cert,src=/path/to/proxy-ca.pem -t fraud-risk-agent:1.0.0 .
+RUN --mount=type=secret,id=pip_cert \
+    if [ -s /run/secrets/pip_cert ]; then export PIP_CERT=/run/secrets/pip_cert; fi; \
+    pip install -r requirements-server.txt
 COPY fra_agent.py server.py ./
 
 # Run as an unprivileged user; the app writes nothing to disk.

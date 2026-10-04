@@ -6,7 +6,9 @@ services:
     build: .
     image: fraud-risk-agent:1.0.0
     ports:
-      - "${FRA_PORT:-8000}:8000"
+      # Loopback only by default: put your TLS proxy in front (DEPLOYMENT.md s4). Docker-published
+      # ports bypass host firewalls such as ufw, so only widen FRA_BIND on a private network.
+      - "${FRA_BIND:-127.0.0.1}:${FRA_PORT:-8000}:8000"
     environment:
       FRA_API_TOKEN: ${FRA_API_TOKEN:?Set FRA_API_TOKEN in .env (see .env.example)}
       FRA_PUBLIC_URL: ${FRA_PUBLIC_URL:-http://localhost:8000}
@@ -16,6 +18,7 @@ services:
       FRA_LOG_LEVEL: ${FRA_LOG_LEVEL:-INFO}
       OLLAMA_HOST: http://ollama:11434
     restart: unless-stopped
+    stop_grace_period: 25s  # longer than uvicorn's 20 s graceful shutdown (Docker's default is 10 s)
     read_only: true
     tmpfs:
       - /tmp
