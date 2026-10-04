@@ -83,7 +83,7 @@ jobs:
     timeout-minutes: 25
     env:
       FRA_API_TOKEN: ci-token
-      FRA_LLM_TIMEOUT: "60"  # check the compose wiring here, not CPU speed
+      FRA_LLM_TIMEOUT: "10"  # the supported maximum: larger values leave no queueing room under Pega's 15 s
     steps:
       - uses: actions/checkout@v4
       - name: Build and start (template only)
@@ -104,8 +104,12 @@ jobs:
           docker compose --profile llm run --rm ollama-pull
           curl -fsS localhost:8000/health | grep -q '"llm_wording":"on"'
           docker compose exec -T ollama ollama run llama3.2 "Say OK." > /dev/null   # load the model once
-          curl -fsS -X POST localhost:8000/v1/assess -H "Authorization: Bearer $FRA_API_TOKEN" \
-               -H "Content-Type: application/json" -d @examples/request_duplicate.json
+          # The first call also fills Ollama's prompt cache with the system prompt; the second is fast.
+          for attempt in 1 2; do
+            curl -fsS -X POST localhost:8000/v1/assess -H "Authorization: Bearer $FRA_API_TOKEN" \
+                 -H "Content-Type: application/json" -d @examples/request_duplicate.json
+            echo
+          done
           docker compose logs fra | grep "narrative="
           docker compose logs fra | grep -q "narrative=llm"   # the reply was worded by the model
       - name: Container logs
