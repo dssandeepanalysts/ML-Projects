@@ -1,0 +1,57 @@
+# Template wording only (default):   docker compose up -d --build
+# With local Ollama wording:          FRA_USE_LLM=1 docker compose --profile llm up -d --build
+# Settings come from .env (copy .env.example). See DEPLOYMENT.md.
+services:
+  fra:
+    build: .
+    image: fraud-risk-agent:1.0.0
+    ports:
+      - "${FRA_PORT:-8000}:8000"
+    environment:
+      FRA_API_TOKEN: ${FRA_API_TOKEN:?Set FRA_API_TOKEN in .env (see .env.example)}
+      FRA_PUBLIC_URL: ${FRA_PUBLIC_URL:-http://localhost:8000}
+      FRA_USE_LLM: ${FRA_USE_LLM:-0}
+      FRA_OLLAMA_MODEL: ${FRA_OLLAMA_MODEL:-llama3.2}
+      FRA_LLM_TIMEOUT: ${FRA_LLM_TIMEOUT:-8}
+      FRA_LOG_LEVEL: ${FRA_LOG_LEVEL:-INFO}
+      OLLAMA_HOST: http://ollama:11434
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The health check is defined in the Dockerfile (GET /health every 30 s).
+
+  # Optional local LLM. Only started with --profile llm. If it is missing, slow or still
+  # downloading the model, the agent answers with the template wording.
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.35.1}
+    profiles: ["llm"]
+    volumes:
+      - ollama:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h  # keep the model loaded: a cold start takes 10-17 s on CPU
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # One-off job: downloads the model into the ollama volume, then exits.
+  ollama-pull:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.35.1}
+    profiles: ["llm"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${FRA_OLLAMA_MODEL:-llama3.2}"]
+    restart: "no"
+
+volumes:
+  ollama:

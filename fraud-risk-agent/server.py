@@ -92,7 +92,8 @@ async def internal_error(request: Request, exc: Exception) -> JSONResponse:
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "version": AGENT_VERSION}
+    """Liveness for Docker/Kubernetes. Stays "ok" when Ollama is down: the template still answers."""
+    return {"status": "ok", "version": AGENT_VERSION, "llm_wording": "on" if agent.llm is not None else "off"}
 
 
 @app.get("/.well-known/agent.json")

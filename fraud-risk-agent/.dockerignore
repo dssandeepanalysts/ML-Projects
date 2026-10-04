@@ -1,0 +1,5 @@
+# Only fra_agent.py, server.py and requirements-server.txt go into the image.
+*
+!fra_agent.py
+!server.py
+!requirements-server.txt

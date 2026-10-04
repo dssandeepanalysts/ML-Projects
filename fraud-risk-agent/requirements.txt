@@ -1,9 +1,5 @@
-# Agent core (fra_agent.py)
-langchain-core>=1.0,<2
-langchain-ollama>=1.0,<2
-# A2A server (server.py)
-fastapi>=0.115
-uvicorn>=0.30
+# Agent and A2A server (also used by the Docker image)
+-r requirements-server.txt
 # Evaluation (evaluate.py)
 pandas>=2.2
 scikit-learn>=1.5

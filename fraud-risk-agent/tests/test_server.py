@@ -21,6 +21,10 @@ def rpc(claim, method="message/send"):
     return {"jsonrpc": "2.0", "id": 7, "method": method, "params": {"message": message}}
 
 
+def test_health_is_public(client):
+    assert client.get("/health").json() == {"status": "ok", "version": "1.0.0", "llm_wording": "off"}
+
+
 def test_agent_card_is_public_and_meets_spec_3_2(client):
     card = client.get("/.well-known/agent.json").json()
     assert [s["id"] for s in card["skills"]] == ["assess_fraud_risk"]

@@ -76,3 +76,41 @@ jobs:
               print(f"{row['claim_id']} {'LLM     ' if used else 'TEMPLATE'} {seconds:5.1f}s | {llm['reasoning']}")
           print(f"\nLLM wording accepted for {accepted}/{len(rows)} flagged claims")
           PY
+
+  # Builds the real Dockerfile and runs the docker-compose stack the way DEPLOYMENT.md describes.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FRA_API_TOKEN: ci-token
+      FRA_LLM_TIMEOUT: "60"  # check the compose wiring here, not CPU speed
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start (template only)
+        run: docker compose up -d --build --wait
+      - name: Smoke test the container
+        run: |
+          curl -fsS localhost:8000/health
+          test "$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q fra)")" = healthy
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8000/v1/assess -d '{}')" = 401
+          curl -fsS -X POST localhost:8000/v1/assess -H "Authorization: Bearer $FRA_API_TOKEN" \
+               -H "Content-Type: application/json" -d @examples/request_duplicate.json \
+            | python3 -c "import json,sys; r=json.load(sys.stdin); print(r); assert (r['status'], r['risk_score']) == ('COMPLETED', 70)"
+      - name: Start with the Ollama profile and pull the model
+        env:
+          FRA_USE_LLM: "1"
+        run: |
+          docker compose --profile llm up -d --wait fra ollama
+          docker compose --profile llm run --rm ollama-pull
+          curl -fsS localhost:8000/health | grep -q '"llm_wording":"on"'
+          docker compose exec -T ollama ollama run llama3.2 "Say OK." > /dev/null   # load the model once
+          curl -fsS -X POST localhost:8000/v1/assess -H "Authorization: Bearer $FRA_API_TOKEN" \
+               -H "Content-Type: application/json" -d @examples/request_duplicate.json
+          docker compose logs fra | grep "narrative="
+          docker compose logs fra | grep -q "narrative=llm"   # the reply was worded by the model
+      - name: Container logs
+        if: always()
+        run: docker compose --profile llm logs --no-color | tail -50
+      - name: Clean up
+        if: always()
+        run: docker compose --profile llm down -v
