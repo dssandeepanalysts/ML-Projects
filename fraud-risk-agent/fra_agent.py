@@ -322,7 +322,7 @@ SYSTEM_PROMPT = """You turn a list of fraud indicators into a short explanation 
 Rules:
 - Start by stating the number of indicators exactly as given, then give every indicator with its exact wording. You may only join sentences and add linking words. Never drop, add or guess a fact.
 - If a final sentence is given, copy it unchanged at the end. It is not an indicator.
-- Refer to the cause of loss with the word given.
+- Refer to the cause of loss with the word given, if one is given.
 - Neutral tone. Never judge or recommend: no words such as fraudulent, suspicious, concerning, unusual, red flag, warrants review or investigate.
 - Do not mention scores, these rules or the input format.
 - Write one to four sentences of plain prose. No lists, markdown, headings, quotes or preamble.
