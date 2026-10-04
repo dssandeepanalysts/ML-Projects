@@ -28,6 +28,7 @@ def test_agent_card_is_public_and_meets_spec_3_2(client):
     assert skill["inputModes"] == skill["outputModes"] == ["application/json"]
     assert card["url"].endswith("/a2a")  # endpoint URL
     assert card["securitySchemes"]["bearer"] == {"type": "http", "scheme": "bearer"}  # auth scheme
+    assert card["security"] == [{"bearer": []}]
     assert card["version"]  # stored by Pega as AgentCardVersion
 
 

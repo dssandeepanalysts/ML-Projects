@@ -88,14 +88,16 @@ UUID_V4 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0
 # Pega's PascalCase (DateOfBirth, PolicyNumber, ConfidenceScore) all match.
 FORBIDDEN_KEYS = {
     # claimant
-    "name", "claimantname", "fullname", "firstname", "lastname", "dateofbirth", "dob",
-    "phone", "phonenumber", "mobile", "email", "emailaddress", "address", "postaladdress",
+    "name", "claimantname", "fullname", "firstname", "lastname", "nameddrivers", "dateofbirth",
+    "birthdate", "dob", "phone", "phonenumber", "mobile", "mobilephone", "email", "emailaddress",
+    "address", "postaladdress",
     # vehicle and policy in clear text, photos
-    "make", "model", "year", "vehiclemake", "vehiclemodel", "vehicleyear", "vin",
-    "policynumber", "photo", "photos", "photourls",
-    # the damage agent's output (Blueprint 12.3)
-    "estimatedcost", "damageestimate", "severity", "severitylevel", "confidencescore",
-    "damageconfidence", "damageassessment",
+    "make", "model", "year", "vehiclemake", "vehiclemodel", "vehicleyear", "vin", "vinnumber",
+    "vehiclevin", "policynumber", "policyno", "insurancepolicynumber", "linkedpolicynumber",
+    "photo", "photos", "photourls",
+    # the damage agent's output (Blueprint 12.3, 10.7)
+    "estimate", "estimatedcost", "damageestimate", "severity", "severitylevel", "confidencescore",
+    "damageconfidence", "damageassessment", "damagedparts", "totalloss", "totallossindicator",
 }
 
 # Instruction-like text in the claimant's description. It cannot change the result (the
@@ -345,9 +347,9 @@ One indicator was found on this fire claim: the claimed vehicle does not match a
 PROMPT = ChatPromptTemplate.from_messages([("system", SYSTEM_PROMPT), ("human", "{facts}")])
 
 # Wording the spec rules out (s9): accusations, judgements and recommendations. Word stems, so
-# "fraudulently", "suspected" or "faked" are caught too; only the phrase "fraud indicator(s)" is allowed.
+# "fraudulently", "suspected" or "faked" are caught too.
 JUDGEMENTAL = re.compile(
-    r"\b(fraud(?!\s+indicators?\b)\w*|liars?|l(?:ie|ies|ied|ying)|crimin\w*|crimes?|guilt\w*|scam\w*"
+    r"\b(fraud\w*|liars?|l(?:ie|ies|ied|ying)|crimin\w*|crimes?|guilt\w*|scam\w*"
     r"|fak(?:e|ed|es|ery|ing)|fabricat\w*|falsif\w*|bogus|dubious|questionable|dishonest\w*|decei\w*"
     r"|decept\w*|suspicio\w*|suspect\w*|staged|illegal\w*|irregular\w*|concern\w*|unusual\w*|red flags?"
     r"|warrant\w*|further review|investigat\w*|recommend\w*|deviat\w*|probabl\w*|likely|should|must"
@@ -366,14 +368,12 @@ INDICATOR_COUNT = re.compile(
 )
 COUNT_VALUES = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "both": 2}
 LIST_ITEM = re.compile(r"^\s*([-\u2022]|\d+[.)])\s", re.MULTILINE)
-MARKUP = re.compile(r"[*#`<>\[\]{}|_\\]")
-# Closed vocabulary: once the exact indicator sentences and the missing-data sentence are removed,
-# only these linking words (plus the cause of loss) may remain. Anything else is a new claim.
-LINKING_WORDS = set(
-    "a an one two three four five both indicator indicators was were found identified on in for of "
-    "this the claim and also additionally addition further furthermore moreover as well while with "
-    "which its it is are has have there these following".split()
-)
+# The template's own characters. Anything else (quotes, ?, !, bullets, emoji, other scripts,
+# look-alike letters) is rejected before any word-level check can be fooled by it.
+PLAIN_PROSE = re.compile(r"[A-Za-z0-9 ,.;:-]*")
+# Closed structure: [opener] + the exact indicator sentences + [no other indicators were found] +
+# [missing-data sentence]. Once those are removed only these joining words may remain.
+LINKING_WORDS = {"and", "also", "additionally", "furthermore", "moreover", "in", "addition", "while", "as", "well"}
 NO_OTHER_INDICATORS = re.compile(r"no other indicators? (?:was|were) found", re.IGNORECASE)
 
 # Total time allowed for one LLM explanation; Pega allows 15 s per attempt (spec s10.1).
@@ -401,15 +401,24 @@ def _echoes(source: str, text: str, n: int = 6) -> bool:
     return any(" ".join(words[i : i + n]) in flat for i in range(len(words) - n + 1))
 
 
+def _opener(req: dict, fired: list[str]) -> re.Pattern:
+    """ "One indicator was found on this theft claim": the right count, and the cause only here."""
+    n = len(fired)
+    counts = ["one", "an", "a"] if n == 1 else [COUNT_WORDS[n].lower()] + (["both"] if n == 2 else [])
+    cause = re.escape(req["loss"]["cause"].lower())
+    return re.compile(
+        rf"^(?:{'|'.join(counts)}) indicators? (?:was|were) (?:found|identified)(?: (?:on|for|in) this {cause} claim)?"
+    )
+
+
 def _unexplained_words(text: str, req: dict, fired: list[str]) -> list[str]:
-    """Words left after removing the exact facts, the opener and "no other indicators were found"."""
-    rest = " ".join(text.lower().split())
+    """Words left after removing the opener, the exact facts and "no other indicators were found"."""
+    rest = _opener(req, fired).sub(" ", " ".join(text.lower().split()), count=1)
     for phrase in [indicator_phrase(code, req) for code in fired] + [data_note(req)]:
         if phrase:
             rest = rest.replace(phrase.lower(), " ")
     rest = NO_OTHER_INDICATORS.sub(" ", rest)
-    allowed = LINKING_WORDS | {req["loss"]["cause"].lower()}
-    return [word for word in re.findall(r"[a-z0-9']+", rest) if word not in allowed]
+    return [word for word in re.findall(r"[^\W_]+", rest) if word not in LINKING_WORDS]
 
 
 def narrative_problems(raw: str, req: dict, fired: list[str]) -> list[str]:
@@ -419,23 +428,32 @@ def narrative_problems(raw: str, req: dict, fired: list[str]) -> list[str]:
     problems = []
     if not 20 <= len(text) <= 800:
         problems.append("length")
-    if MARKUP.search(text) or LIST_ITEM.search(raw):
+    if LIST_ITEM.search(raw):
         problems.append("markup")
+    if not PLAIN_PROSE.fullmatch(text):
+        problems.append("characters outside plain prose")
     if JUDGEMENTAL.search(text):
         problems.append("judgemental wording")
     if META.search(text):
         problems.append("talks about the prompt")
     # Every fired indicator in its exact wording, so its numbers stay attached to the right fact.
-    if any(indicator_phrase(code, req).lower() not in lowered for code in fired):
+    phrases = [indicator_phrase(code, req).lower() for code in fired]
+    if any(phrase not in lowered for phrase in phrases):
         problems.append("missing indicator")
+    no_other = NO_OTHER_INDICATORS.search(lowered)
+    if no_other and any(lowered.rfind(phrase) > no_other.start() for phrase in phrases):
+        problems.append("no other indicators before an indicator")
     if any(KEY_PHRASES[code] in lowered for code in INDICATORS if code not in fired):
         problems.append("indicator that did not fire")
     stated = [COUNT_VALUES.get(w.lower(), int(w) if w.isdigit() else None) for w in INDICATOR_COUNT.findall(text)]
     if any(n != len(fired) for n in stated):
         problems.append("wrong indicator count")
-    # The missing-data sentence exactly when data was missing; never an invented one.
-    note = data_note(req)
-    if (note and note.lower() not in lowered) or (not note and "could not be" in lowered):
+    # The missing-data sentence exactly when data was missing, as its own final sentence (so it
+    # cannot pose as an indicator); never an invented one.
+    note = data_note(req).lower()
+    if note and not (lowered.endswith(note) and lowered[: -len(note)].rstrip().endswith(".")):
+        problems.append("missing-data sentence wrong")
+    if not note and "could not be" in lowered:
         problems.append("missing-data sentence wrong")
     if _unexplained_words(text, req, fired):
         problems.append("adds words beyond the facts")
@@ -453,13 +471,15 @@ def narrative_problems(raw: str, req: dict, fired: list[str]) -> list[str]:
 def _generate(llm, facts: str, stop: threading.Event) -> str:
     # Stream the model itself rather than a prompt|llm|parser chain: closing the model's own
     # stream drops the HTTP connection at once (so Ollama stops), a chain only closes when done.
+    if stop.is_set():
+        return ""  # queued behind other calls past the deadline: do not call the model at all
     stream = llm.stream(PROMPT.invoke({"facts": facts}))
     parts = []
     try:
         for chunk in stream:
             if stop.is_set():
                 break  # the caller already gave up at its deadline
-            parts.append(getattr(chunk, "content", chunk))
+            parts.append(str(chunk.text) if hasattr(chunk, "text") else str(chunk))  # str or message chunk
     finally:
         stream.close()
     return "".join(parts)
@@ -477,6 +497,7 @@ def llm_reasoning(llm, req: dict, fired: list[str]) -> str | None:
         text = future.result(timeout=LLM_TIMEOUT)
     except FutureTimeout:  # a slow model must not push the reply past Pega's timeout
         stop.set()
+        future.cancel()  # if it has not started yet, it never will
         log.warning("claim_id=%s LLM exceeded %.1f s; using template", req["claim_id"], LLM_TIMEOUT)
         return None
     except Exception as exc:  # Ollama down, model missing, read timeout...

@@ -5,9 +5,11 @@ No Ollama needed: the LLM is replaced by a RunnableLambda that returns canned te
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessageChunk
 from langchain_core.runnables import RunnableLambda
 
 import fra_agent
@@ -129,6 +131,9 @@ def test_invalid_fields_fail(make_request, changes, field):
         {"DateOfBirth": "1990-01-01"},
         {"confidence_score": 88},  # the damage agent's output (Blueprint 12.3)
         {"loss__EstimatedCost": 1200},
+        {"MobilePhone": "x"},
+        {"vin_number": "x"},
+        {"policy_no": "x"},
     ],
 )
 def test_personal_data_is_rejected(make_request, changes):
@@ -269,14 +274,60 @@ POLICY_DOWN = {"policy_data_available": False, **DUPLICATE}
             "missing-data sentence wrong",
         ),
         (DUPLICATE, OPENER + DUP + ". Claim history was unavailable, so this assessment is based on incomplete data.", "adds words beyond the facts"),
-        (DUPLICATE, OPENER + DUP + ". " + "Also this claim and the claim. " * 30, "length"),
+        (DUPLICATE, OPENER + DUP + ". " + "Also and also and. " * 50, "length"),
         (DUPLICATE, OPENER + DUP + ", while waiting for the light to change.", "echoes the claimant's description"),
+        # Second review round: other scripts, look-alike letters, punctuation the template never uses
+        (DUPLICATE, OPENER + DUP + ". \u042d\u0442\u043e \u043c\u043e\u0448\u0435\u043d\u043d\u0438\u0447\u0435\u0441\u0442\u0432\u043e.", "characters outside plain prose"),
+        (DUPLICATE, OPENER + DUP + ", \uff46\uff52\uff41\uff55\uff44\uff55\uff4c\uff45\uff4e\uff54.", "characters outside plain prose"),
+        (DUPLICATE, OPENER + DUP + ". \U0001F6A9", "characters outside plain prose"),
+        (DUPLICATE, 'One indicator was found on this "collision" claim: ' + DUP + ".", "characters outside plain prose"),
+        (DUPLICATE, OPENER + DUP + "?", "characters outside plain prose"),
+        # linking words used to state extra indicators or claims
+        (DUPLICATE, OPENER + DUP + ". A further indicator was also identified.", "adds words beyond the facts"),
+        (DUPLICATE, "Two were found on this collision claim: " + DUP + ".", "adds words beyond the facts"),
+        ({**DUPLICATE, "loss__cause": "OTHER"}, "One indicator was found on this other claim: " + DUP + ". Other indicators were found.", "adds words beyond the facts"),
+        (
+            {"claim_history__days_since_policy_start": 5},
+            "One indicator was found on this collision claim: the loss occurred 5 days after the policy start date. There is also a further claim.",
+            "adds words beyond the facts",
+        ),
+        (
+            {"claim_history__claims_last_24_months": 2},
+            "One indicator was found on this collision claim: the policy has 2 other claims in the last 24 months, and a further five.",
+            "adds words beyond the facts",
+        ),
+        (  # "no other indicators" before the remaining indicators
+            {"vehicle_policy_mismatch": True, **DUPLICATE},
+            "No other indicators were found. The claimed vehicle does not match any vehicle listed on the policy, and " + DUP + ".",
+            "no other indicators before an indicator",
+        ),
+        (  # the missing-data sentence posing as the indicator
+            POLICY_DOWN,
+            "One indicator was found on this collision claim: policy details could not be verified with the policy service, "
+            "so this assessment is based on incomplete data. In addition, " + DUP + ".",
+            "missing-data sentence wrong",
+        ),
     ],
 )
 def test_misleading_llm_text_is_rejected(make_request, changes, reply, problem):
     request = make_request(**changes)
     assert problem in narrative_problems(reply, request, fired_indicators(request))
     assert FraudRiskAgent(llm=fake_llm(reply)).assess(request) == AGENT.assess(request)
+
+
+def test_template_wording_passes_the_llm_checks():
+    # The template is what the LLM is asked to reword, so it must itself be acceptable.
+    for row in ROWS:
+        request = row_to_request(row)
+        fired = fired_indicators(request)
+        if fired:
+            assert narrative_problems(fra_agent.template_reasoning(request, fired), request, fired) == [], row["claim_id"]
+
+
+def test_message_chunks_with_content_blocks_are_read(make_request):
+    chunk = AIMessageChunk(content=[{"type": "text", "text": GOOD_REPLY}])
+    result = FraudRiskAgent(llm=RunnableLambda(lambda _: chunk)).assess(make_request(**DUPLICATE))
+    assert result["reasoning"] == " ".join(GOOD_REPLY.split())
 
 
 def test_hash_in_llm_text_is_rejected(make_request):
@@ -326,6 +377,23 @@ def test_slow_llm_falls_back_within_the_deadline(make_request, monkeypatch):
     result = FraudRiskAgent(llm=RunnableLambda(lambda _: time.sleep(2) or GOOD_REPLY)).assess(request)
     assert time.perf_counter() - started < 1.5
     assert result == AGENT.assess(request)
+
+
+def test_timed_out_queued_call_never_reaches_the_model(make_request, monkeypatch):
+    monkeypatch.setattr(fra_agent, "LLM_TIMEOUT", 0.2)
+    monkeypatch.setattr(fra_agent, "_LLM_POOL", ThreadPoolExecutor(max_workers=1))
+    calls = []
+
+    def slow(_):
+        calls.append(1)
+        time.sleep(1)
+        return GOOD_REPLY
+
+    agent, request = FraudRiskAgent(llm=RunnableLambda(slow)), make_request(**DUPLICATE)
+    agent.assess(request)  # occupies the only worker past its deadline
+    agent.assess(request)  # queued behind it, gives up at its own deadline
+    time.sleep(1.2)
+    assert calls == [1]
 
 
 def test_logs_hold_no_description_hashes_or_forged_lines(make_request, caplog):  # spec s12.3
