@@ -79,18 +79,31 @@ Watch these in the logs (one line per claim; the claimant's description and the 
 Pega gets an access token from your identity provider (OAuth 2.0 client credentials) and sends it as
 `Authorization: Bearer <token>`. On every call the agent checks:
 
-* the signature, against the provider's public keys from `FRA_OAUTH_JWKS_URL` (never a URL named
-  in the token). Keys are cached for 10 minutes. A token signed with a new key makes the agent
-  refetch them (at most once a minute), so key rotation needs no restart;
+* the signature, against the provider's public keys from `FRA_OAUTH_JWKS_URL`, never from a URL
+  named in the token;
 * the algorithm: RS, PS or ES only (never `none` or HS256);
-* `exp` (required, with 30 s of clock-skew allowance) and `nbf` if present;
+* `exp` (required), and `nbf` and `iat` if present, each with 30 s of clock-skew allowance;
 * `iss` equals `FRA_OAUTH_ISSUER` exactly, and `aud` contains `FRA_OAUTH_AUDIENCE`;
 * the scope `FRA_OAUTH_SCOPE` (default `fraud.assess`) in the `scope`, `scp` or `roles` claim.
 
-A missing, invalid or expired token gets `401`, a valid token without the scope gets `403`, and if
-the key endpoint cannot be reached the agent fails closed with `503` (Pega may retry). The log line
-says why (`token rejected: InvalidAudienceError`) and never contains the token. The agent itself
-holds no secret in this mode, only public keys.
+A missing, invalid or expired token gets `401`, and a valid token without the scope gets `403`. If
+the agent cannot get the provider's keys it fails closed with `503` and `Retry-After: 10`, so Pega
+may retry. The log line says why (`token rejected: InvalidAudienceError`) and never contains the
+token. The agent itself holds no secret in this mode, only public keys.
+
+How the agent fetches the provider's keys:
+
+* It fetches them on first use and keeps them for 10 minutes; after that it refreshes them in the
+  background while still answering with the cached keys.
+* A token signed with a key it has not seen (the provider rotated its keys) makes it fetch again,
+  so key rotation needs no restart. Fetches run one at a time and at most once every 10 s, so forged
+  tokens cannot make the agent flood your provider. A token with a brand-new key that arrives within
+  10 s of the previous fetch is refused until the next fetch; providers that publish new keys
+  before using them (Entra ID, Okta) avoid this.
+* If the provider cannot be reached, the agent keeps using the last keys it fetched for up to an hour.
+* A request waits at most 3 s for a fetch. The URL must answer directly: redirects are not followed.
+* The URL must use https. Plain http is refused unless `FRA_OAUTH_ALLOW_HTTP=1`, which exists only for
+  the local Keycloak below: over http, anyone on the network path could swap in their own keys.
 
 | Setting | Local Keycloak value | Notes |
 |---|---|---|
@@ -99,6 +112,7 @@ holds no secret in this mode, only public keys.
 | `FRA_OAUTH_JWKS_URL` | `http://keycloak:8080/realms/claims/protocol/openid-connect/certs` | Must be reachable from inside the container |
 | `FRA_OAUTH_SCOPE` | `fraud.assess` | The default |
 | `FRA_OAUTH_TOKEN_URL` | `http://localhost:8180/realms/claims/protocol/openid-connect/token` | Optional; only shown in the Agent Card |
+| `FRA_OAUTH_ALLOW_HTTP` | `1` | Local testing only: allows the plain-http key URL above. Leave it unset in production |
 
 The first three turn OAuth on and must be set together; set only some and the agent refuses to start.
 Once they are set, `FRA_API_TOKEN` is ignored.
@@ -106,7 +120,7 @@ Once they are set, `FRA_API_TOKEN` is ignored.
 ### 4.1 Try it locally with Keycloak
 
 ```bash
-# in .env: set KC_ADMIN_PASSWORD, and the FRA_OAUTH_* lines to the values in the table above
+# in .env: set KC_ADMIN_PASSWORD, and remove the "# " in front of the five FRA_OAUTH_* lines
 docker compose --profile oauth up -d --build --wait     # agent + Keycloak, about a minute
 TOKEN=$(keycloak/get-token.sh)                           # a client-credentials token, as Pega gets one
 curl -s -X POST localhost:8000/v1/assess -H "Authorization: Bearer $TOKEN" \
@@ -127,16 +141,36 @@ you change `KC_PORT`, change the port in `FRA_OAUTH_ISSUER` and `FRA_OAUTH_TOKEN
 |---|---|---|---|
 | `FRA_OAUTH_ISSUER` | `https://<host>/realms/<realm>` | `https://login.microsoftonline.com/<tenant-id>/v2.0` | `https://<org>.okta.com/oauth2/<server-id>` |
 | `FRA_OAUTH_JWKS_URL` | `https://<host>/realms/<realm>/protocol/openid-connect/certs` | `https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys` | `https://<org>.okta.com/oauth2/<server-id>/v1/keys` |
-| `FRA_OAUTH_AUDIENCE` | The audience mapper's value, e.g. `fraud-risk-agent` | The agent's app registration: Application (client) ID | The authorization server's audience, e.g. `api://fraud-risk-agent` |
-| `fraud.assess` is | A client scope, sent in `scope` | An app role, granted to Pega's app registration as an application permission (admin consent), sent in `roles` | A custom scope, sent in `scp` |
+| `FRA_OAUTH_AUDIENCE` | The audience mapper's value, e.g. `fraud-risk-agent` | The agent's app registration: Application (client) ID | Your dedicated authorization server's audience, e.g. `api://fraud-risk-agent` |
+| `fraud.assess` is | A client scope, assigned to Pega's client only, sent in `scope` | An app role, granted to Pega's app registration as an application permission (admin consent), sent in `roles` | A custom scope, allowed for Pega's client only by an access policy, sent in `scp` |
 | Token URL | `https://<host>/realms/<realm>/protocol/openid-connect/token` | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` | `https://<org>.okta.com/oauth2/<server-id>/v1/token` |
 | Scope Pega requests | `fraud.assess` | `<agent's Application ID URI>/.default` | `fraud.assess` |
 
 * **Entra ID:** set the access token version to 2 in the agent app's manifest
   (`requestedAccessTokenVersion`, or `accessTokenAcceptedVersion` in older manifests). Version 1
   tokens carry `iss` `https://sts.windows.net/<tenant-id>/` and the Application ID URI as `aud`.
-* **Okta:** client credentials with a custom scope needs a custom authorization server (for example
-  `default`), not the org authorization server.
+* **Okta:** create a dedicated custom authorization server for the agent (audience
+  `api://fraud-risk-agent`). Don't use the built-in `default` server: its audience `api://default` is
+  shared by every app that uses it, and its default access policy lets every client request any
+  scope. Give the new server one access policy, assigned only to Pega's client, with a rule for the
+  client credentials grant and the scope `fraud.assess`.
+* **Whichever provider:** grant `fraud.assess` to Pega's client and nothing else (in Keycloak, don't
+  make it a realm-wide default client scope). The agent accepts any token from your provider that has
+  the right issuer, audience and scope, so the provider decides who may call it.
+* **Private CA or outbound proxy:** the image trusts the usual public CAs. If your provider's
+  certificate comes from an internal CA, or the agent must go through a proxy, add a
+  `docker-compose.override.yml`:
+
+  ```yaml
+  services:
+    fra:
+      environment:
+        SSL_CERT_FILE: /etc/fra/ca-bundle.pem   # replaces the default CA list, so include public roots if needed
+        HTTPS_PROXY: http://proxy.example:3128
+        NO_PROXY: keycloak,ollama
+      volumes:
+        - ./ca-bundle.pem:/etc/fra/ca-bundle.pem:ro
+  ```
 * To check the values, decode a test token locally (never paste production tokens into websites):
   `python -c "import jwt,sys; print(jwt.decode(sys.argv[1], options={'verify_signature': False}))" "$TOKEN"`
   and copy `iss` and `aud` exactly, including any trailing slash.
@@ -179,8 +213,9 @@ To roll back, tag each release image (`fraud-risk-agent:<version>`) and start th
 | `up --wait` fails; the log says `Refusing to start: no authentication configured` | No `.env` file, or neither `FRA_API_TOKEN` nor the OAuth settings are set: `cp .env.example .env` and set one. |
 | `Refusing to start: OAuth is half configured` | Set `FRA_OAUTH_ISSUER`, `FRA_OAUTH_AUDIENCE` and `FRA_OAUTH_JWKS_URL` together. |
 | `401` on every call (static token) | The token Pega sends does not match `FRA_API_TOKEN`. |
-| `401`, log `token rejected: <reason>` (OAuth) | `InvalidIssuerError`: `FRA_OAUTH_ISSUER` differs from the token's `iss` (a trailing slash, or `localhost` vs another host name). `InvalidAudienceError`: wrong `FRA_OAUTH_AUDIENCE`, or the provider does not add it. `ExpiredSignatureError`: an expired token, or clocks more than 30 s apart. `InvalidSignatureError` or `no signing key`: `FRA_OAUTH_JWKS_URL` belongs to another realm or tenant. `DecodeError`: not a JWT at all (some providers issue opaque tokens unless an API audience is requested). |
+| `Refusing to start: FRA_OAUTH_JWKS_URL uses plain http` | Use the provider's https key URL. Only for the local Keycloak, set `FRA_OAUTH_ALLOW_HTTP=1`. |
+| `401`, log `token rejected: <reason>` (OAuth) | `InvalidIssuerError`: `FRA_OAUTH_ISSUER` differs from the token's `iss` (a trailing slash, or `localhost` vs another host name). `InvalidAudienceError`: wrong `FRA_OAUTH_AUDIENCE`, or the provider does not add it. `ExpiredSignatureError`: an expired token, or the agent's clock is ahead of the provider's by more than the token's lifetime. `ImmatureSignatureError`: the token's `iat` or `nbf` is in the future, usually because the agent's clock is more than 30 s behind the provider's: sync the host clock (NTP). `UnknownSigningKey`: no key with the token's `kid`, because `FRA_OAUTH_JWKS_URL` belongs to another realm or tenant, or (locally) Keycloak was recreated with new keys after the token was issued: get a new token. `InvalidSignatureError`: the token was altered, or the key URL is wrong. `DecodeError`: not a JWT at all (some providers issue opaque tokens unless an API audience is requested). |
 | `403` | The token is valid but lacks `FRA_OAUTH_SCOPE` in `scope`, `scp` or `roles`: grant the scope (or app role) to Pega's client. |
-| `503 Cannot verify tokens right now` | The agent cannot reach `FRA_OAUTH_JWKS_URL` from inside the container (log: `cannot fetch signing keys`). Check DNS, firewall and proxy settings. |
+| `503 Cannot verify tokens right now`, log `cannot fetch signing keys from FRA_OAUTH_JWKS_URL: <reason>` | `HTTP 404`: wrong path. `HTTP 301`/`302`: the URL redirects; use the provider's `jwks_uri` exactly as its discovery document gives it. `CERTIFICATE_VERIFY_FAILED`: the provider's certificate is from a CA the image does not trust (see "Private CA" in section 4.2). `Name or service not known`, `Connection refused`, `timed out` or `did not answer within 3 s`: DNS, firewall or proxy (see section 4.2). `not a JSON Web Key Set`: the URL returns a web page, not the keys. `no usable signing keys`: the key set has no signing key with a key ID that the agent can use. |
 | `llm_wording` is `on` but replies use the template | The model is not downloaded yet (run `ollama-pull`), or replies take longer than `FRA_LLM_TIMEOUT`. Check `docker compose logs fra`. |
 | `pip` TLS errors during `docker build` | Your network intercepts TLS. Build with your proxy's CA as a build secret, which does not end up in the image: `docker build --secret id=pip_cert,src=/path/to/proxy-ca.pem -t fraud-risk-agent:1.0.0 .`, then `docker compose up -d --wait` (without `--build`). |

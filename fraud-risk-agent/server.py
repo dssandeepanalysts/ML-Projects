@@ -12,8 +12,9 @@ Endpoints
     GET  /health                   Liveness check
 
 Authentication (spec s4), one of:
-    OAuth 2.0 (production)  FRA_OAUTH_ISSUER, FRA_OAUTH_AUDIENCE, FRA_OAUTH_JWKS_URL, and optionally
-                            FRA_OAUTH_SCOPE (default fraud.assess) and FRA_OAUTH_TOKEN_URL (Agent Card only)
+    OAuth 2.0 (production)  FRA_OAUTH_ISSUER, FRA_OAUTH_AUDIENCE, FRA_OAUTH_JWKS_URL (https), and optionally
+                            FRA_OAUTH_SCOPE (default fraud.assess), FRA_OAUTH_TOKEN_URL (Agent Card only)
+                            and FRA_OAUTH_ALLOW_HTTP=1 (an http JWKS URL, for local testing only)
     Static token (local)    FRA_API_TOKEN, used only when OAuth is not configured
 The server refuses to start with neither, or with OAuth half configured.
 
@@ -24,12 +25,17 @@ FRA_LLM_TIMEOUT settings in fra_agent.py.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import secrets
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -51,32 +57,41 @@ agent = FraudRiskAgent(llm=build_ollama_llm() if os.getenv("FRA_USE_LLM", "0") =
 OAUTH_REQUIRED = ("FRA_OAUTH_ISSUER", "FRA_OAUTH_AUDIENCE", "FRA_OAUTH_JWKS_URL")
 # Asymmetric only: rules out "none" and HS256 signed with the public key (algorithm confusion).
 OAUTH_ALGORITHMS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"]
-JWKS_CACHE_SECONDS = 600  # reuse the provider's signing keys this long
-JWKS_REFRESH_SECONDS = 60  # a token naming an unknown key refetches them at most this often
+LEEWAY_SECONDS = 30  # clock skew allowed between us and the provider (exp, nbf, iat)
+
+
+def _env(name: str) -> str:
+    """A setting with stray whitespace removed (a pasted newline, a space): blank counts as unset."""
+    return os.getenv(name, "").strip()
 
 
 def oauth_settings() -> dict | None:
     """The OAuth settings, or None when OAuth is not (fully) configured. Read per call, like FRA_API_TOKEN."""
-    if not all(os.getenv(name) for name in OAUTH_REQUIRED):
+    if not all(_env(name) for name in OAUTH_REQUIRED):
         return None
     return {
-        "issuer": os.environ["FRA_OAUTH_ISSUER"],
-        "audience": os.environ["FRA_OAUTH_AUDIENCE"],
-        "jwks_url": os.environ["FRA_OAUTH_JWKS_URL"],
-        "scope": os.getenv("FRA_OAUTH_SCOPE") or "fraud.assess",
-        "token_url": os.getenv("FRA_OAUTH_TOKEN_URL", ""),
+        "issuer": _env("FRA_OAUTH_ISSUER"),
+        "audience": _env("FRA_OAUTH_AUDIENCE"),
+        "jwks_url": _env("FRA_OAUTH_JWKS_URL"),
+        "scope": _env("FRA_OAUTH_SCOPE") or "fraud.assess",
+        "token_url": _env("FRA_OAUTH_TOKEN_URL"),
     }
 
 
 def auth_problem() -> str | None:
-    """Why the current settings cannot authenticate anyone, or None if they can."""
-    missing = [name for name in OAUTH_REQUIRED if not os.getenv(name)]
+    """Why the current settings cannot authenticate anyone safely, or None if they can."""
+    missing = [name for name in OAUTH_REQUIRED if not _env(name)]
     if 0 < len(missing) < len(OAUTH_REQUIRED):
         return f"OAuth is half configured: also set {', '.join(missing)}"
-    if not missing and urlparse(os.environ["FRA_OAUTH_JWKS_URL"]).scheme not in ("http", "https"):
-        return "FRA_OAUTH_JWKS_URL must be an http(s) URL"
-    if missing and not os.getenv("FRA_API_TOKEN"):
-        return "no authentication configured: set the FRA_OAUTH_* settings, or FRA_API_TOKEN for local use"
+    if missing:
+        return None if _env("FRA_API_TOKEN") else \
+            "no authentication configured: set the FRA_OAUTH_* settings, or FRA_API_TOKEN for local use"
+    url = urlparse(_env("FRA_OAUTH_JWKS_URL"))
+    if url.scheme not in ("http", "https") or not url.hostname:
+        return "FRA_OAUTH_JWKS_URL must be an https URL"
+    # Whoever can change the keys in transit can mint tokens, so plain http needs an explicit opt-in.
+    if url.scheme == "http" and _env("FRA_OAUTH_ALLOW_HTTP") != "1":
+        return "FRA_OAUTH_JWKS_URL uses plain http: use https (FRA_OAUTH_ALLOW_HTTP=1 allows http for local testing)"
     return None
 
 
@@ -87,53 +102,164 @@ async def lifespan(_app: FastAPI):
     if problem:
         raise RuntimeError(f"Refusing to start: {problem} (see DEPLOYMENT.md)")
     settings = oauth_settings()
-    if settings and os.getenv("FRA_API_TOKEN"):
-        log.warning("OAuth is configured, so FRA_API_TOKEN is ignored")
-    if settings and urlparse(settings["jwks_url"]).scheme == "http":
-        log.warning("FRA_OAUTH_JWKS_URL uses plain http: fine for local testing, use https in production")
-    log.info("authentication: %s", "OAuth 2.0 JWT" if settings else "static token (local use only)")
+    if settings is None:
+        log.warning("authentication: static token (FRA_API_TOKEN), for local use only; "
+                    "set the FRA_OAUTH_* settings in production")
+    else:
+        log.info("authentication: OAuth 2.0 JWT (issuer %s, audience %s)", settings["issuer"], settings["audience"])
+        if _env("FRA_API_TOKEN"):
+            log.warning("OAuth is configured, so FRA_API_TOKEN is ignored")
+        if urlparse(settings["jwks_url"]).scheme == "http":
+            log.warning("FRA_OAUTH_JWKS_URL uses plain http (FRA_OAUTH_ALLOW_HTTP=1): for local testing only")
     yield
 
 
-@functools.lru_cache(maxsize=4)
-def _jwks_client(url: str) -> jwt.PyJWKClient:
-    return jwt.PyJWKClient(url, lifespan=JWKS_CACHE_SECONDS, timeout=3)
+# ---------------------------------------------------------------- the provider's signing keys (JWKS)
+JWKS_FRESH_SECONDS = 600  # keys older than this are refetched (in the background while they still work)
+JWKS_RETRY_SECONDS = 10  # at most one fetch per this interval, whatever asks for it
+JWKS_STALE_SECONDS = 3600  # while the provider is unreachable, keep using the last keys this long
+JWKS_TIMEOUT = 3.0  # seconds a request waits for a fetch
+JWKS_MAX_BYTES = 1_000_000
+
+# One fetch at a time, in its own thread: a stalled key endpoint can tie up this thread only, never the
+# workers that answer Pega (urllib's timeout covers each socket read, not the whole download).
+_jwks_fetcher = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fra-jwks")
 
 
-_last_refresh: dict[str, float] = {}
-_refresh_lock = threading.Lock()
+class KeysUnavailable(Exception):
+    """The provider's keys could not be fetched: the provider's problem, not the token's (503)."""
 
 
-def signing_key(url: str, kid) -> jwt.PyJWK:
-    """The provider's public key named by the token's kid. Only the configured JWKS URL is used, never
-    a URL from the token. An unknown kid (the provider rotated its keys) refetches the keys, at most
-    once per JWKS_REFRESH_SECONDS, so forged tokens cannot make us flood the provider."""
-    client = _jwks_client(url)
-    for refresh in (False, True):
-        if refresh:
-            with _refresh_lock:
-                now = time.monotonic()
-                if now - _last_refresh.get(url, float("-inf")) < JWKS_REFRESH_SECONDS:
-                    break
-                _last_refresh[url] = now
-        key = next((k for k in client.get_signing_keys(refresh=refresh) if k.key_id == kid), None)
+class UnknownSigningKey(jwt.InvalidTokenError):
+    """The token names a key (kid) that the provider does not publish (401)."""
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # use the provider's jwks_uri exactly as configured
+        return None
+
+
+def fetch_signing_keys(url: str) -> dict[str, dict]:
+    """Download the JWK Set from the configured URL; return {kid: JWK} for its usable signing keys.
+    Raises KeysUnavailable with a reason fit for the log (no token data can reach it).
+    The default opener honours HTTPS_PROXY / NO_PROXY and SSL_CERT_FILE."""
+    if urlparse(url).scheme not in ("http", "https"):  # urllib would also open file:// and ftp://
+        raise KeysUnavailable("not an http(s) URL")
+    try:
+        with urllib.request.build_opener(_NoRedirects).open(url, timeout=JWKS_TIMEOUT) as response:
+            body = response.read(JWKS_MAX_BYTES + 1)
+    except urllib.error.HTTPError as exc:  # includes redirects, which are not followed
+        exc.close()
+        raise KeysUnavailable(f"HTTP {exc.code}") from None
+    except (urllib.error.URLError, OSError) as exc:  # DNS, connection, TLS certificate, timeout
+        raise KeysUnavailable(str(getattr(exc, "reason", exc))) from None
+    if len(body) > JWKS_MAX_BYTES:
+        raise KeysUnavailable("the response is larger than 1 MB")
+    try:
+        candidates = [k for k in json.loads(body)["keys"] if isinstance(k, dict)]
+    except (ValueError, TypeError, KeyError, RecursionError):
+        raise KeysUnavailable("the response is not a JSON Web Key Set") from None
+    keys = {}
+    for jwk in candidates:
+        if isinstance(jwk.get("kid"), str) and jwk.get("use", "sig") == "sig":
+            try:
+                jwt.PyJWK(jwk)  # skip key types we cannot use
+            except (jwt.PyJWTError, ValueError, TypeError, KeyError):
+                continue
+            keys[jwk["kid"]] = jwk
+    if not keys:
+        raise KeysUnavailable("the key set has no usable signing keys")
+    return keys
+
+
+class ProviderKeys:
+    """The provider's signing keys, cached. They come only from FRA_OAUTH_JWKS_URL, never from a URL in a
+    token. At most one fetch runs at a time and one starts per JWKS_RETRY_SECONDS, so forged tokens cannot
+    make the agent flood the provider; and the last good keys are kept while the provider is unreachable."""
+
+    def __init__(self, url: str):
+        self.url = url
+        self.keys: dict[str, dict] = {}
+        self.fetched_at = float("-inf")  # last successful fetch
+        self.attempted_at = float("-inf")  # last fetch started
+        self.fetch: Future | None = None
+        self.slow_fetch: Future | None = None  # the stalled fetch already logged
+        self.last_error = "no keys fetched yet"
+        self.lock = threading.Lock()
+
+    def get(self, kid) -> dict:
+        """The JWK for this kid. Raises UnknownSigningKey or KeysUnavailable."""
+        with self.lock:
+            age = time.monotonic() - self.fetched_at
+            key = self.keys.get(kid) if age < JWKS_STALE_SECONDS else None
+            fetch = self._start_fetch() if key is None or age >= JWKS_FRESH_SECONDS else None
         if key is not None:
-            return key
-    raise jwt.InvalidTokenError("no signing key matches the token's kid")
+            return key  # if the keys are getting old, the fetch just started runs in the background
+        if fetch is not None:  # a new kid (the provider rotated its keys) or no keys yet: wait for the fetch
+            try:
+                fetch.result(timeout=JWKS_TIMEOUT)
+            except FutureTimeout:
+                reason = f"the key endpoint did not answer within {JWKS_TIMEOUT:g} s"
+                with self.lock:
+                    first, self.slow_fetch = self.slow_fetch is not fetch, fetch
+                if first:  # once per stalled fetch, not once per waiting request
+                    log.error("cannot fetch signing keys from FRA_OAUTH_JWKS_URL: %s", reason)
+                raise KeysUnavailable(reason) from None
+            with self.lock:
+                key = self.keys.get(kid)
+            if key is not None:
+                return key
+        with self.lock:
+            usable = time.monotonic() - self.fetched_at < JWKS_STALE_SECONDS
+        if usable:  # the provider answered recently and does not publish this kid
+            raise UnknownSigningKey("no signing key matches the token's kid")
+        raise KeysUnavailable(self.last_error)
+
+    def _start_fetch(self) -> Future | None:  # with self.lock held
+        if self.fetch is not None and not self.fetch.done():
+            return self.fetch  # share the fetch in progress
+        if time.monotonic() - self.attempted_at < JWKS_RETRY_SECONDS:
+            return None
+        self.attempted_at = time.monotonic()
+        self.fetch = _jwks_fetcher.submit(self._refresh)
+        return self.fetch
+
+    def _refresh(self) -> None:
+        try:
+            keys = fetch_signing_keys(self.url)
+        except Exception as exc:  # KeysUnavailable, or anything unexpected: keep the last good keys
+            reason = str(exc) if isinstance(exc, KeysUnavailable) else type(exc).__name__
+            with self.lock:
+                self.last_error, age = reason, time.monotonic() - self.fetched_at
+            still = f"; still using keys fetched {age:.0f} s ago" if age < JWKS_STALE_SECONDS else ""
+            log.error("cannot fetch signing keys from FRA_OAUTH_JWKS_URL: %s%s", reason, still)
+            raise KeysUnavailable(reason) from None
+        with self.lock:
+            self.keys, self.fetched_at = keys, time.monotonic()
+
+
+@functools.lru_cache(maxsize=4)
+def provider_keys(url: str) -> ProviderKeys:
+    return ProviderKeys(url)
 
 
 def decode_access_token(token: str, settings: dict) -> dict:
-    """Verify signature, expiry, issuer and audience; return the claims. Raises jwt.PyJWTError."""
-    header = jwt.get_unverified_header(token)
+    """Verify signature, expiry, issuer and audience; return the claims.
+    Raises jwt.PyJWTError (or ValueError for a malformed token) for a bad token, KeysUnavailable otherwise."""
+    try:
+        header = jwt.get_unverified_header(token)
+    except (ValueError, TypeError, RecursionError):  # e.g. a deeply nested header: still just a bad token
+        raise jwt.DecodeError("malformed token header") from None
     if header.get("alg") not in OAUTH_ALGORITHMS:  # checked before any key fetch
         raise jwt.InvalidAlgorithmError("algorithm not allowed")
+    jwk = provider_keys(settings["jwks_url"]).get(header.get("kid"))
     return jwt.decode(
         token,
-        signing_key(settings["jwks_url"], header.get("kid")),
+        jwt.PyJWK(jwk, jwk.get("alg") or header["alg"]),  # "alg" is optional in a JWK (RFC 7517 s4.4)
         algorithms=OAUTH_ALGORITHMS,
         audience=settings["audience"],
         issuer=settings["issuer"],
-        leeway=30,  # seconds of clock skew between us and the provider
+        leeway=LEEWAY_SECONDS,
         options={"require": ["exp", "iss", "aud"]},
     )
 
@@ -150,8 +276,15 @@ def granted_scopes(claims: dict) -> set[str]:
     return granted
 
 
-def _reject(status: int, detail: str, error: str = "invalid_token") -> HTTPException:
-    return HTTPException(status_code=status, detail=detail, headers={"WWW-Authenticate": f'Bearer error="{error}"'})
+def _reject(status: int, detail: str, error: str | None = "invalid_token") -> HTTPException:
+    # RFC 6750 s3.1: no error code when the request carried no credentials at all.
+    return HTTPException(status_code=status, detail=detail,
+                         headers={"WWW-Authenticate": f'Bearer error="{error}"' if error else "Bearer"})
+
+
+def _unavailable(detail: str) -> HTTPException:
+    """503: the call may succeed if Pega retries (the provider's keys could not be fetched)."""
+    return HTTPException(status_code=503, detail=detail, headers={"Retry-After": str(JWKS_RETRY_SECONDS)})
 
 
 bearer = HTTPBearer(auto_error=False)
@@ -164,26 +297,25 @@ async def authenticate(creds: HTTPAuthorizationCredentials | None = Depends(bear
     problem = auth_problem()
     if problem:  # the startup check normally stops this earlier
         log.error("cannot authenticate: %s", problem)
-        raise _reject(503, "Authentication is not configured.", "temporarily_unavailable")
+        raise _unavailable("Authentication is not configured.")
     settings = oauth_settings()
     if creds is None:
-        raise _reject(401, "Missing or invalid bearer token.")
+        raise _reject(401, "Missing or invalid bearer token.", error=None)
     if settings is None:
         # Compare bytes: compare_digest raises on non-ASCII str, which would turn a bad token into a 500.
-        if not secrets.compare_digest(creds.credentials.encode(), os.environ["FRA_API_TOKEN"].encode()):
+        if not secrets.compare_digest(creds.credentials.encode(), _env("FRA_API_TOKEN").encode()):
             raise _reject(401, "Missing or invalid bearer token.")
         return arrived
     try:  # in a worker thread: a key fetch must not block the event loop
         claims = await run_in_threadpool(decode_access_token, creds.credentials, settings)
-    except (jwt.PyJWKClientError, jwt.PyJWKSetError) as exc:  # the provider's key endpoint, not the token
-        log.error("cannot fetch signing keys from FRA_OAUTH_JWKS_URL: %s", type(exc).__name__)
-        raise _reject(503, "Cannot verify tokens right now.", "temporarily_unavailable") from None
-    except jwt.PyJWTError as exc:  # the reason is logged, never the token or the caller's text
-        log.info("token rejected: %s", type(exc).__name__)
+    except KeysUnavailable:  # the fetch logs why
+        raise _unavailable("Cannot verify tokens right now.") from None
+    except (jwt.PyJWTError, ValueError, TypeError, OverflowError, RecursionError) as exc:
+        log.info("token rejected: %s", type(exc).__name__)  # the reason, never the token or the caller's text
         raise _reject(401, "Missing or invalid bearer token.") from None
     except Exception as exc:  # anything unexpected while checking: fail closed
         log.error("token check failed: %s", type(exc).__name__)
-        raise _reject(503, "Cannot verify tokens right now.", "temporarily_unavailable") from None
+        raise _unavailable("Cannot verify tokens right now.") from None
     if settings["scope"] not in granted_scopes(claims):
         log.info("token rejected: missing scope %s", settings["scope"])
         raise _reject(403, "The token does not grant the required scope.", "insufficient_scope")

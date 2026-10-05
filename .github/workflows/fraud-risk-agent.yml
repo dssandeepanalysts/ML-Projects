@@ -134,6 +134,7 @@ jobs:
           FRA_OAUTH_AUDIENCE=fraud-risk-agent
           FRA_OAUTH_JWKS_URL=http://keycloak:8080/realms/claims/protocol/openid-connect/certs
           FRA_OAUTH_TOKEN_URL=http://localhost:8180/realms/claims/protocol/openid-connect/token
+          FRA_OAUTH_ALLOW_HTTP=1
           EOF
           docker compose --profile oauth up -d --build --wait
       - name: Call the agent with a Keycloak token

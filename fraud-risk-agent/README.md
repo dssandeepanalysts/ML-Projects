@@ -53,7 +53,7 @@ End to end, for one claim:
 | `langchain-ollama` | 1.1 | ✓ MIT | `ChatOllama` client for the local model | `fra_agent.py` |
 | **Ollama** + `llama3.2` (3B) | any recent release | ✓ MIT / Llama 3.2 licence | local LLM for explanation wording (optional) | runtime |
 | `fastapi` + `uvicorn` | 0.142 / 0.50 | ✓ MIT / BSD | A2A JSON-RPC and REST endpoints, Agent Card | `server.py` |
-| `PyJWT[crypto]` | 2.15 | ✓ MIT | checks OAuth 2.0 access tokens: signature (provider's JWKS), expiry, issuer, audience, scope | `server.py` |
+| `PyJWT[crypto]` | 2.13 / 2.15 | ✓ MIT | checks OAuth 2.0 access tokens: signature (provider's JWKS), expiry, issuer, audience, scope | `server.py` |
 | **Keycloak** (Docker) | 26.8 | ✓ Apache 2.0 | local identity provider to try OAuth end to end (optional, testing only) | `docker-compose.yml` |
 | `pandas`, `scikit-learn` | 3.0 / 1.9 | ✓ BSD | batch evaluation, shadow challenger model | `evaluate.py` |
 | `pytest`, `httpx` | 9.1 / 0.28 | ✓ MIT / BSD | test suite, FastAPI TestClient | `tests/` |
@@ -81,6 +81,7 @@ Configuration (all optional):
 | `FRA_USE_LLM` | `0` | server only: `1` turns on Ollama wording (the CLI uses it unless `--no-llm`) |
 | `FRA_OAUTH_ISSUER`, `FRA_OAUTH_AUDIENCE`, `FRA_OAUTH_JWKS_URL` | *(unset)* | server: OAuth 2.0 mode, set all three; see [DEPLOYMENT.md §4](DEPLOYMENT.md#4-oauth-20-login) |
 | `FRA_OAUTH_SCOPE`, `FRA_OAUTH_TOKEN_URL` | `fraud.assess`, *(unset)* | server: scope the token must carry; token URL shown in the Agent Card |
+| `FRA_OAUTH_ALLOW_HTTP` | *(unset)* | server: `1` allows a plain-http key URL, for the local Keycloak only (production needs https) |
 | `FRA_API_TOKEN` | *(unset)* | server, local use only: static bearer token, ignored in OAuth mode. With neither, the server refuses to start |
 | `FRA_PUBLIC_URL` | `http://localhost:8000` | URL advertised in the Agent Card |
 | `FRA_LOG_LEVEL` | `INFO` | log level |
@@ -171,8 +172,8 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 | **1. Ingestion & contract** | `row_to_request`, `read_csv_rows`, `validate_request`, `FAILED` responses | CLI that rejects bad payloads with the field name | `python -m pytest -k "invalid or personal or missing_field or non_object or unknown or nested"` (31 tests) · `python fra_agent.py --no-llm --request examples/request_missing_field.json` |
 | **2. Rule engine & confidence** | `fired_indicators`, `risk_score`, `compute_confidence`, self-check | deterministic scorer | `python -m pytest -k "acceptance or confidence or boundaries or at7 or at8 or out_of_range or internal_error"` (21 tests): AT-1…AT-8 exact |
 | **3. Reasoning (template, then LLM)** | `template_reasoning`; LangChain prompt → `ChatOllama`; `narrative_problems` guardrails; fallback | explanations for every claim, with or without Ollama | `python -m pytest -k "llm or llama or wording or missing_data or template_wording or chunks or queued or stream"` (72 tests, fake LLM, no Ollama needed) · `python fra_agent.py --request examples/request_all_indicators.json` (real Ollama) |
-| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 195 passed · `python evaluate.py` → 1500/1500 identical (exits non-zero otherwise) · CI runs both on every PR, plus the real-model smoke job |
-| **5. A2A service** | `server.py`: Agent Card, OAuth 2.0 JWT checks (or a static token locally), JSON-RPC `message/send`, REST `/v1/assess`, `/health` | HTTP service Pega can call | `python -m pytest tests/test_server.py tests/test_oauth.py` (70 tests) · `uvicorn server:app` + the curl calls below |
+| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 213 passed · `python evaluate.py` → 1500/1500 identical (exits non-zero otherwise) · CI runs both on every PR, plus the real-model smoke job |
+| **5. A2A service** | `server.py`: Agent Card, OAuth 2.0 JWT checks (or a static token locally), JSON-RPC `message/send`, REST `/v1/assess`, `/health` | HTTP service Pega can call | `python -m pytest tests/test_server.py tests/test_oauth.py` (88 tests) · `uvicorn server:app` + the curl calls below |
 | **6. Deployment** | `Dockerfile` (non-root, health check, graceful shutdown), `docker-compose.yml` (optional Ollama and Keycloak profiles), `.env.example`, [DEPLOYMENT.md](DEPLOYMENT.md) | container Pega can reach | `docker compose up -d --build --wait` → `(healthy)`; CI job `docker` builds the image and runs the stack, incl. the Ollama profile with the real model; CI job `oauth` calls the agent with a real Keycloak token |
 
 **Before production** (out of scope for this build, per spec §13 and §15; steps in [DEPLOYMENT.md §5](DEPLOYMENT.md#5-before-production-steps-that-need-your-infrastructure-details)): point the `FRA_OAUTH_*` settings at your identity provider; put HTTPS in front; confirm the A2A version and DataPart shape with Pega (O-1); review LLM wording quality on a sample with adjusters (target: zero factual errors, F-M09); start collecting SIU-confirmed outcomes so a model can be trained and tested later.
@@ -184,9 +185,9 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 | File | Lines | What it is |
 |---|---|---|
 | [`fra_agent.py`](fra_agent.py) | ~640 | **The agent**: contract validation, rule engine, confidence, template and LLM reasoning with guardrails, self-check, CLI. Self-contained; this is the only file needed to score a claim. |
-| [`server.py`](server.py) | ~310 | A2A / REST front door (FastAPI): Agent Card, OAuth 2.0 JWT checks (static token for local use), JSON-RPC `message/send` |
+| [`server.py`](server.py) | ~450 | A2A / REST front door (FastAPI): Agent Card, OAuth 2.0 JWT checks (static token for local use), JSON-RPC `message/send` |
 | [`evaluate.py`](evaluate.py) | ~100 | Batch evaluation and the shadow scikit-learn challenger |
-| [`tests/`](tests) | ~900 | 195 pytest tests: acceptance AT-1…AT-8, boundaries, validation, self-check, log hygiene, 1,500-row reproduction, LLM guardrails (fake model, real llama3.2 outputs, deadline), server, OAuth (forged, expired and wrong-audience tokens, key rotation, startup check) |
+| [`tests/`](tests) | ~1,100 | 213 pytest tests: acceptance AT-1…AT-8, boundaries, validation, self-check, log hygiene, 1,500-row reproduction, LLM guardrails (fake model, real llama3.2 outputs, deadline), server, OAuth (forged, expired and wrong-audience tokens, key rotation, provider outages against a real local key endpoint, startup check) |
 | [`../.github/workflows/fraud-risk-agent.yml`](../.github/workflows/fraud-risk-agent.yml) | ~155 | CI: tests + evaluation, the `ollama-smoke` job with the real model, the `docker` job (builds the image and runs the Compose stack, incl. the Ollama profile) and the `oauth` job (real Keycloak token) |
 | [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml), [`.env.example`](.env.example) | – | Container image (non-root, health check) and Compose stack with optional Ollama and Keycloak; see [DEPLOYMENT.md](DEPLOYMENT.md) |
 | [`keycloak/`](keycloak) | – | Test realm for the local Keycloak (`claims-realm.json`) and `get-token.sh`, which fetches a token the way Pega will |

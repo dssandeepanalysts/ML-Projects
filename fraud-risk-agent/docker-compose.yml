@@ -7,7 +7,7 @@ services:
     build: .
     image: fraud-risk-agent:1.0.0
     ports:
-      # Loopback only by default: put your TLS proxy in front (DEPLOYMENT.md s4). Docker-published
+      # Loopback only by default: put your TLS proxy in front (DEPLOYMENT.md s5). Docker-published
       # ports bypass host firewalls such as ufw, so only widen FRA_BIND on a private network.
       - "${FRA_BIND:-127.0.0.1}:${FRA_PORT:-8000}:8000"
     environment:
@@ -19,6 +19,7 @@ services:
       FRA_OAUTH_JWKS_URL: ${FRA_OAUTH_JWKS_URL:-}
       FRA_OAUTH_SCOPE: ${FRA_OAUTH_SCOPE:-fraud.assess}
       FRA_OAUTH_TOKEN_URL: ${FRA_OAUTH_TOKEN_URL:-}
+      FRA_OAUTH_ALLOW_HTTP: ${FRA_OAUTH_ALLOW_HTTP:-}  # 1 only for the local Keycloak below
       FRA_PUBLIC_URL: ${FRA_PUBLIC_URL:-http://localhost:8000}
       FRA_USE_LLM: ${FRA_USE_LLM:-0}
       FRA_OLLAMA_MODEL: ${FRA_OLLAMA_MODEL:-llama3.2}

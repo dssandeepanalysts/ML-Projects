@@ -3,4 +3,4 @@ langchain-core>=1.0,<2
 langchain-ollama>=1.0,<2
 fastapi>=0.115
 uvicorn>=0.30
-PyJWT[crypto]>=2.10,<3  # OAuth 2.0 access tokens (server.py)
+PyJWT[crypto]>=2.13,<3  # OAuth 2.0 access tokens (server.py); tested on 2.13 and 2.15
