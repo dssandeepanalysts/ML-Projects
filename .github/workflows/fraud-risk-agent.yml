@@ -118,3 +118,39 @@ jobs:
       - name: Clean up
         if: always()
         run: docker compose --profile llm down -v
+
+  # The real OAuth 2.0 flow, as DEPLOYMENT.md describes it: a local Keycloak issues a client-credentials
+  # token and the agent checks it against Keycloak's signing keys.
+  oauth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the agent and Keycloak (oauth profile)
+        run: |
+          cat > .env <<EOF
+          KC_ADMIN_PASSWORD=$(openssl rand -hex 16)
+          FRA_OAUTH_ISSUER=http://localhost:8180/realms/claims
+          FRA_OAUTH_AUDIENCE=fraud-risk-agent
+          FRA_OAUTH_JWKS_URL=http://keycloak:8080/realms/claims/protocol/openid-connect/certs
+          FRA_OAUTH_TOKEN_URL=http://localhost:8180/realms/claims/protocol/openid-connect/token
+          EOF
+          docker compose --profile oauth up -d --build --wait
+      - name: Call the agent with a Keycloak token
+        run: |
+          TOKEN=$(keycloak/get-token.sh)
+          echo "::add-mask::$TOKEN"
+          curl -fsS -X POST localhost:8000/v1/assess -H "Authorization: Bearer $TOKEN" \
+               -H "Content-Type: application/json" -d @examples/request_duplicate.json \
+            | python3 -c "import json,sys; r=json.load(sys.stdin); print(r); assert (r['status'], r['risk_score']) == ('COMPLETED', 70)"
+          for auth in "" "Authorization: Bearer not-a-jwt" "Authorization: Bearer ${TOKEN%.*}.AAAA"; do
+            test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8000/v1/assess -H "$auth" -d @examples/request_duplicate.json)" = 401
+          done
+          curl -fsS localhost:8000/.well-known/agent.json | python3 -c \
+            "import json,sys; c=json.load(sys.stdin); assert c['security'] == [{'oauth2': ['fraud.assess']}], c"
+      - name: Container logs
+        if: always()
+        run: docker compose --profile oauth logs --no-color | tail -40
+      - name: Clean up
+        if: always()
+        run: docker compose --profile oauth down -v

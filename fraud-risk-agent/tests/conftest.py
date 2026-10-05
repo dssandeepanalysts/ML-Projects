@@ -41,3 +41,11 @@ def build_request(**changes):
 @pytest.fixture
 def make_request():
     return build_request
+
+
+@pytest.fixture(autouse=True)
+def no_auth_settings_from_the_shell(monkeypatch):
+    """Each test sets the auth settings it needs; a developer's own FRA_OAUTH_* must not leak in."""
+    for name in ("FRA_API_TOKEN", "FRA_OAUTH_ISSUER", "FRA_OAUTH_AUDIENCE", "FRA_OAUTH_JWKS_URL",
+                 "FRA_OAUTH_SCOPE", "FRA_OAUTH_TOKEN_URL"):
+        monkeypatch.delenv(name, raising=False)

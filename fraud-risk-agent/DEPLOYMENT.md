@@ -7,8 +7,9 @@ run as many copies as you like behind a load balancer.
 | File | Purpose |
 |---|---|
 | `Dockerfile` | Python 3.11-slim image, non-root user, built-in health check, graceful shutdown |
-| `docker-compose.yml` | `fra` service (loopback port, read-only, 25 s stop grace); `ollama` + one-off `ollama-pull` services behind the `llm` profile |
+| `docker-compose.yml` | `fra` service (loopback port, read-only, 25 s stop grace); `ollama` + one-off `ollama-pull` services behind the `llm` profile; a test `keycloak` behind the `oauth` profile |
 | `.env.example` | All settings; copy to `.env` |
+| `keycloak/` | Test realm (`claims-realm.json`) and `get-token.sh` for trying OAuth locally |
 | `requirements-server.txt` | Runtime dependencies only (what the image installs) |
 
 ## 1. Run it
@@ -17,7 +18,7 @@ Needs Docker with Compose v2.
 
 ```bash
 cd fraud-risk-agent
-cp .env.example .env                       # then set FRA_API_TOKEN (compose refuses to start without it)
+cp .env.example .env                       # then set FRA_API_TOKEN, or the OAuth settings (section 4)
 docker compose up -d --build --wait        # returns once the container reports healthy
 curl -s localhost:8000/health              # {"status":"ok","version":"1.0.0","llm_wording":"off"}
 curl -s -X POST localhost:8000/v1/assess -H "Authorization: Bearer <your token>" \
@@ -25,7 +26,9 @@ curl -s -X POST localhost:8000/v1/assess -H "Authorization: Bearer <your token>"
 ```
 
 This is the recommended production mode. Explanations use the fixed template, so a reply takes
-about 1 ms. The port is published on `127.0.0.1` only (`FRA_BIND`); see section 4 for HTTPS.
+about 1 ms. The port is published on `127.0.0.1` only (`FRA_BIND`); see section 5 for HTTPS.
+`FRA_API_TOKEN` is a stand-in for local use; production uses OAuth 2.0 (section 4). With neither set,
+the agent refuses to start and `docker compose logs fra` says why.
 Docker gives the container 25 s to finish in-flight calls on stop or update. If you run the image
 without Compose, use `docker run --stop-timeout 25` (or `docker stop -t 25`).
 
@@ -71,21 +74,95 @@ Watch these in the logs (one line per claim; the claimant's description and the 
 * `narrative=template-fallback`, `LLM unavailable` or `LLM exceeded`: only matters in LLM mode.
 * `ms=`: processing time. It should stay far below Pega's 15 s.
 
-## 4. Before production: steps that need your infrastructure details
+## 4. OAuth 2.0 login
+
+Pega gets an access token from your identity provider (OAuth 2.0 client credentials) and sends it as
+`Authorization: Bearer <token>`. On every call the agent checks:
+
+* the signature, against the provider's public keys from `FRA_OAUTH_JWKS_URL` (never a URL named
+  in the token). Keys are cached for 10 minutes. A token signed with a new key makes the agent
+  refetch them (at most once a minute), so key rotation needs no restart;
+* the algorithm: RS, PS or ES only (never `none` or HS256);
+* `exp` (required, with 30 s of clock-skew allowance) and `nbf` if present;
+* `iss` equals `FRA_OAUTH_ISSUER` exactly, and `aud` contains `FRA_OAUTH_AUDIENCE`;
+* the scope `FRA_OAUTH_SCOPE` (default `fraud.assess`) in the `scope`, `scp` or `roles` claim.
+
+A missing, invalid or expired token gets `401`, a valid token without the scope gets `403`, and if
+the key endpoint cannot be reached the agent fails closed with `503` (Pega may retry). The log line
+says why (`token rejected: InvalidAudienceError`) and never contains the token. The agent itself
+holds no secret in this mode, only public keys.
+
+| Setting | Local Keycloak value | Notes |
+|---|---|---|
+| `FRA_OAUTH_ISSUER` | `http://localhost:8180/realms/claims` | Exactly the tokens' `iss` claim |
+| `FRA_OAUTH_AUDIENCE` | `fraud-risk-agent` | A value in the tokens' `aud` claim |
+| `FRA_OAUTH_JWKS_URL` | `http://keycloak:8080/realms/claims/protocol/openid-connect/certs` | Must be reachable from inside the container |
+| `FRA_OAUTH_SCOPE` | `fraud.assess` | The default |
+| `FRA_OAUTH_TOKEN_URL` | `http://localhost:8180/realms/claims/protocol/openid-connect/token` | Optional; only shown in the Agent Card |
+
+The first three turn OAuth on and must be set together; set only some and the agent refuses to start.
+Once they are set, `FRA_API_TOKEN` is ignored.
+
+### 4.1 Try it locally with Keycloak
+
+```bash
+# in .env: set KC_ADMIN_PASSWORD, and the FRA_OAUTH_* lines to the values in the table above
+docker compose --profile oauth up -d --build --wait     # agent + Keycloak, about a minute
+TOKEN=$(keycloak/get-token.sh)                           # a client-credentials token, as Pega gets one
+curl -s -X POST localhost:8000/v1/assess -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" -d @examples/request_duplicate.json
+```
+
+`keycloak/claims-realm.json` creates the realm `claims` with a client scope `fraud.assess` (its
+audience mapper adds `fraud-risk-agent` to `aud`) and a confidential client `pega-claim-assist`
+that may use client credentials and gets that scope by default. Keycloak generates the client
+secret: see it in the admin console at `http://localhost:8180` (user `admin`) under realm
+`claims` → Clients → `pega-claim-assist` → Credentials. Recreating the container makes a new one.
+Tokens last 5 minutes. This Keycloak runs in dev mode over plain HTTP: use it for testing only. If
+you change `KC_PORT`, change the port in `FRA_OAUTH_ISSUER` and `FRA_OAUTH_TOKEN_URL` too.
+
+### 4.2 Your identity provider
+
+| | Keycloak | Microsoft Entra ID | Okta |
+|---|---|---|---|
+| `FRA_OAUTH_ISSUER` | `https://<host>/realms/<realm>` | `https://login.microsoftonline.com/<tenant-id>/v2.0` | `https://<org>.okta.com/oauth2/<server-id>` |
+| `FRA_OAUTH_JWKS_URL` | `https://<host>/realms/<realm>/protocol/openid-connect/certs` | `https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys` | `https://<org>.okta.com/oauth2/<server-id>/v1/keys` |
+| `FRA_OAUTH_AUDIENCE` | The audience mapper's value, e.g. `fraud-risk-agent` | The agent's app registration: Application (client) ID | The authorization server's audience, e.g. `api://fraud-risk-agent` |
+| `fraud.assess` is | A client scope, sent in `scope` | An app role, granted to Pega's app registration as an application permission (admin consent), sent in `roles` | A custom scope, sent in `scp` |
+| Token URL | `https://<host>/realms/<realm>/protocol/openid-connect/token` | `https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token` | `https://<org>.okta.com/oauth2/<server-id>/v1/token` |
+| Scope Pega requests | `fraud.assess` | `<agent's Application ID URI>/.default` | `fraud.assess` |
+
+* **Entra ID:** set the access token version to 2 in the agent app's manifest
+  (`requestedAccessTokenVersion`, or `accessTokenAcceptedVersion` in older manifests). Version 1
+  tokens carry `iss` `https://sts.windows.net/<tenant-id>/` and the Application ID URI as `aud`.
+* **Okta:** client credentials with a custom scope needs a custom authorization server (for example
+  `default`), not the org authorization server.
+* To check the values, decode a test token locally (never paste production tokens into websites):
+  `python -c "import jwt,sys; print(jwt.decode(sys.argv[1], options={'verify_signature': False}))" "$TOKEN"`
+  and copy `iss` and `aud` exactly, including any trailing slash.
+
+### 4.3 Pega
+
+Create an OAuth 2.0 authentication profile with grant type client credentials, using the token URL,
+client ID, client secret and scope from your provider. Attach it to the Connect Agent rule, and to the
+Connect-REST rule if you use the `/v1/assess` fallback. Pega fetches and renews the token itself.
+Screen names vary between Pega versions.
+
+## 5. Before production: steps that need your infrastructure details
 
 | Item | What you provide | What to change |
 |---|---|---|
-| **OAuth 2.0** (spec s4) | Identity provider: issuer, audience, JWKS URL, scope (e.g. `fraud.assess`) | Replace the static-token comparison in `require_token()` (`server.py`) with JWT validation against your JWKS, e.g. with PyJWT. Keep `FRA_API_TOKEN` for local use only. |
+| **OAuth 2.0** (spec s4) | Identity provider: issuer, audience, JWKS URL, scope (e.g. `fraud.assess`) | Set the `FRA_OAUTH_*` settings (section 4.2) and remove `FRA_API_TOKEN`. |
 | **HTTPS** | A domain and a TLS certificate | Terminate TLS at your load balancer, ingress or reverse proxy, and forward to the container. A proxy on the same host uses `127.0.0.1:8000` (the default `FRA_BIND`); a proxy in Docker joins the Compose network; a remote load balancer needs `FRA_BIND` set to a private-network IP. Never publish port 8000 on a public interface: Docker-published ports bypass host firewalls such as ufw. Set `FRA_PUBLIC_URL=https://<your-domain>` so the Agent Card advertises the HTTPS endpoint. |
-| **Pega connection** | Your Pega environment | Create the Connect Agent rule from `https://<your-domain>/.well-known/agent.json` (skill `assess_fraud_risk`). Give it an authentication profile with the OAuth client credentials. Confirm the A2A version and DataPart shape (spec open items O-1, O-3). `POST /v1/assess` is the Connect-REST fallback. |
+| **Pega connection** | Your Pega environment | Create the Connect Agent rule from `https://<your-domain>/.well-known/agent.json` (skill `assess_fraud_risk`). Give it the OAuth 2.0 authentication profile (section 4.3). Confirm the A2A version and DataPart shape (spec open items O-1, O-3). `POST /v1/assess` is the Connect-REST fallback. |
 
 Also for production:
-* Keep the token in a secret manager, not in `.env`.
+* Keep secrets in a secret manager, not in `.env`. In OAuth mode the agent needs none (Pega holds the client secret).
 * Pin the image by digest.
 * Ship container logs to your log store.
 * Scale by adding replicas. In LLM mode, run Ollama on a GPU host.
 
-## 5. Day-to-day operations
+## 6. Day-to-day operations
 
 ```bash
 docker compose logs -f fra                      # follow the logs
@@ -99,7 +176,11 @@ To roll back, tag each release image (`fraud-risk-agent:<version>`) and start th
 
 | Symptom | Cause and fix |
 |---|---|
-| `Set FRA_API_TOKEN in .env` when starting | No `.env` file, or `FRA_API_TOKEN` is empty: `cp .env.example .env` and set the token. |
-| `401` on every call | The token Pega sends does not match `FRA_API_TOKEN`. |
+| `up --wait` fails; the log says `Refusing to start: no authentication configured` | No `.env` file, or neither `FRA_API_TOKEN` nor the OAuth settings are set: `cp .env.example .env` and set one. |
+| `Refusing to start: OAuth is half configured` | Set `FRA_OAUTH_ISSUER`, `FRA_OAUTH_AUDIENCE` and `FRA_OAUTH_JWKS_URL` together. |
+| `401` on every call (static token) | The token Pega sends does not match `FRA_API_TOKEN`. |
+| `401`, log `token rejected: <reason>` (OAuth) | `InvalidIssuerError`: `FRA_OAUTH_ISSUER` differs from the token's `iss` (a trailing slash, or `localhost` vs another host name). `InvalidAudienceError`: wrong `FRA_OAUTH_AUDIENCE`, or the provider does not add it. `ExpiredSignatureError`: an expired token, or clocks more than 30 s apart. `InvalidSignatureError` or `no signing key`: `FRA_OAUTH_JWKS_URL` belongs to another realm or tenant. `DecodeError`: not a JWT at all (some providers issue opaque tokens unless an API audience is requested). |
+| `403` | The token is valid but lacks `FRA_OAUTH_SCOPE` in `scope`, `scp` or `roles`: grant the scope (or app role) to Pega's client. |
+| `503 Cannot verify tokens right now` | The agent cannot reach `FRA_OAUTH_JWKS_URL` from inside the container (log: `cannot fetch signing keys`). Check DNS, firewall and proxy settings. |
 | `llm_wording` is `on` but replies use the template | The model is not downloaded yet (run `ollama-pull`), or replies take longer than `FRA_LLM_TIMEOUT`. Check `docker compose logs fra`. |
 | `pip` TLS errors during `docker build` | Your network intercepts TLS. Build with your proxy's CA as a build secret, which does not end up in the image: `docker build --secret id=pip_cert,src=/path/to/proxy-ca.pem -t fraud-risk-agent:1.0.0 .`, then `docker compose up -d --wait` (without `--build`). |

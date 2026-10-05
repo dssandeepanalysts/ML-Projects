@@ -19,7 +19,7 @@ It is built from four source files:
  Pega Claim Assistant                         Fraud Risk Agent (this folder)
  ────────────────────                         ──────────────────────────────
  Connect Agent ── A2A JSON-RPC ──▶ server.py ─▶ FraudRiskAgent.assess(payload)   (fra_agent.py)
- (or Connect-REST /v1/assess)       bearer auth   │
+ (or Connect-REST /v1/assess)       OAuth 2.0 JWT │
                                                   ├─1 validate_request ───── invalid ──▶ FAILED + field name
                                                   ├─2 fired_indicators + risk_score      (rules, pure code)
                                                   ├─3 compute_confidence                 (data availability)
@@ -53,10 +53,12 @@ End to end, for one claim:
 | `langchain-ollama` | 1.1 | ✓ MIT | `ChatOllama` client for the local model | `fra_agent.py` |
 | **Ollama** + `llama3.2` (3B) | any recent release | ✓ MIT / Llama 3.2 licence | local LLM for explanation wording (optional) | runtime |
 | `fastapi` + `uvicorn` | 0.142 / 0.50 | ✓ MIT / BSD | A2A JSON-RPC and REST endpoints, Agent Card | `server.py` |
+| `PyJWT[crypto]` | 2.15 | ✓ MIT | checks OAuth 2.0 access tokens: signature (provider's JWKS), expiry, issuer, audience, scope | `server.py` |
+| **Keycloak** (Docker) | 26.8 | ✓ Apache 2.0 | local identity provider to try OAuth end to end (optional, testing only) | `docker-compose.yml` |
 | `pandas`, `scikit-learn` | 3.0 / 1.9 | ✓ BSD | batch evaluation, shadow challenger model | `evaluate.py` |
 | `pytest`, `httpx` | 9.1 / 0.28 | ✓ MIT / BSD | test suite, FastAPI TestClient | `tests/` |
 
-**External services:** none are required. Ollama runs locally, and without it the agent uses the template wording. No paid APIs, no cloud calls.
+**External services:** none are required. Ollama runs locally, and without it the agent uses the template wording. In production the agent fetches signing keys from your identity provider (OAuth 2.0). No paid APIs, no cloud calls.
 
 ```bash
 cd fraud-risk-agent
@@ -77,7 +79,9 @@ Configuration (all optional):
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama URL |
 | `FRA_LLM_TIMEOUT` | `8` | total seconds one LLM explanation may take before the template is used (Pega allows 15 s per attempt) |
 | `FRA_USE_LLM` | `0` | server only: `1` turns on Ollama wording (the CLI uses it unless `--no-llm`) |
-| `FRA_API_TOKEN` | *(unset → all POSTs return 401)* | bearer token the caller must send |
+| `FRA_OAUTH_ISSUER`, `FRA_OAUTH_AUDIENCE`, `FRA_OAUTH_JWKS_URL` | *(unset)* | server: OAuth 2.0 mode, set all three; see [DEPLOYMENT.md §4](DEPLOYMENT.md#4-oauth-20-login) |
+| `FRA_OAUTH_SCOPE`, `FRA_OAUTH_TOKEN_URL` | `fraud.assess`, *(unset)* | server: scope the token must carry; token URL shown in the Agent Card |
+| `FRA_API_TOKEN` | *(unset)* | server, local use only: static bearer token, ignored in OAuth mode. With neither, the server refuses to start |
 | `FRA_PUBLIC_URL` | `http://localhost:8000` | URL advertised in the Agent Card |
 | `FRA_LOG_LEVEL` | `INFO` | log level |
 
@@ -167,11 +171,11 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 | **1. Ingestion & contract** | `row_to_request`, `read_csv_rows`, `validate_request`, `FAILED` responses | CLI that rejects bad payloads with the field name | `python -m pytest -k "invalid or personal or missing_field or non_object or unknown or nested"` (31 tests) · `python fra_agent.py --no-llm --request examples/request_missing_field.json` |
 | **2. Rule engine & confidence** | `fired_indicators`, `risk_score`, `compute_confidence`, self-check | deterministic scorer | `python -m pytest -k "acceptance or confidence or boundaries or at7 or at8 or out_of_range or internal_error"` (21 tests): AT-1…AT-8 exact |
 | **3. Reasoning (template, then LLM)** | `template_reasoning`; LangChain prompt → `ChatOllama`; `narrative_problems` guardrails; fallback | explanations for every claim, with or without Ollama | `python -m pytest -k "llm or llama or wording or missing_data or template_wording or chunks or queued or stream"` (72 tests, fake LLM, no Ollama needed) · `python fra_agent.py --request examples/request_all_indicators.json` (real Ollama) |
-| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 140 passed · `python evaluate.py` → 1500/1500 identical (exits non-zero otherwise) · CI runs both on every PR, plus the real-model smoke job |
-| **5. A2A service** | `server.py`: Agent Card, bearer auth, JSON-RPC `message/send`, REST `/v1/assess`, `/health` | HTTP service Pega can call | `python -m pytest tests/test_server.py` (15 tests) · `uvicorn server:app` + the curl calls below |
-| **6. Deployment** | `Dockerfile` (non-root, health check, graceful shutdown), `docker-compose.yml` (optional Ollama profile), `.env.example`, [DEPLOYMENT.md](DEPLOYMENT.md) | container Pega can reach | `docker compose up -d --build --wait` → `(healthy)`; CI job `docker` builds the image and runs the stack, incl. the Ollama profile with the real model |
+| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 195 passed · `python evaluate.py` → 1500/1500 identical (exits non-zero otherwise) · CI runs both on every PR, plus the real-model smoke job |
+| **5. A2A service** | `server.py`: Agent Card, OAuth 2.0 JWT checks (or a static token locally), JSON-RPC `message/send`, REST `/v1/assess`, `/health` | HTTP service Pega can call | `python -m pytest tests/test_server.py tests/test_oauth.py` (70 tests) · `uvicorn server:app` + the curl calls below |
+| **6. Deployment** | `Dockerfile` (non-root, health check, graceful shutdown), `docker-compose.yml` (optional Ollama and Keycloak profiles), `.env.example`, [DEPLOYMENT.md](DEPLOYMENT.md) | container Pega can reach | `docker compose up -d --build --wait` → `(healthy)`; CI job `docker` builds the image and runs the stack, incl. the Ollama profile with the real model; CI job `oauth` calls the agent with a real Keycloak token |
 
-**Before production** (out of scope for this build, per spec §13 and §15; steps in [DEPLOYMENT.md §4](DEPLOYMENT.md#4-before-production-steps-that-need-your-infrastructure-details)): validate real OAuth 2.0 JWTs instead of a static token; put HTTPS in front; confirm the A2A version and DataPart shape with Pega (O-1); review LLM wording quality on a sample with adjusters (target: zero factual errors, F-M09); start collecting SIU-confirmed outcomes so a model can be trained and tested later.
+**Before production** (out of scope for this build, per spec §13 and §15; steps in [DEPLOYMENT.md §5](DEPLOYMENT.md#5-before-production-steps-that-need-your-infrastructure-details)): point the `FRA_OAUTH_*` settings at your identity provider; put HTTPS in front; confirm the A2A version and DataPart shape with Pega (O-1); review LLM wording quality on a sample with adjusters (target: zero factual errors, F-M09); start collecting SIU-confirmed outcomes so a model can be trained and tested later.
 
 ---
 
@@ -180,12 +184,13 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 | File | Lines | What it is |
 |---|---|---|
 | [`fra_agent.py`](fra_agent.py) | ~640 | **The agent**: contract validation, rule engine, confidence, template and LLM reasoning with guardrails, self-check, CLI. Self-contained; this is the only file needed to score a claim. |
-| [`server.py`](server.py) | ~140 | A2A / REST front door (FastAPI): Agent Card, bearer auth, JSON-RPC `message/send` |
+| [`server.py`](server.py) | ~310 | A2A / REST front door (FastAPI): Agent Card, OAuth 2.0 JWT checks (static token for local use), JSON-RPC `message/send` |
 | [`evaluate.py`](evaluate.py) | ~100 | Batch evaluation and the shadow scikit-learn challenger |
-| [`tests/`](tests) | ~620 | 140 pytest tests: acceptance AT-1…AT-8, boundaries, validation, self-check, log hygiene, 1,500-row reproduction, LLM guardrails (fake model, real llama3.2 outputs, deadline), server |
-| [`../.github/workflows/fraud-risk-agent.yml`](../.github/workflows/fraud-risk-agent.yml) | ~115 | CI: tests + evaluation, the `ollama-smoke` job with the real model, and the `docker` job (builds the image and runs the Compose stack, incl. the Ollama profile) |
-| [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml), [`.env.example`](.env.example) | – | Container image (non-root, health check) and Compose stack with optional Ollama; see [DEPLOYMENT.md](DEPLOYMENT.md) |
-| [`DEPLOYMENT.md`](DEPLOYMENT.md) | – | Short deployment guide: run, optional LLM, health checks, production checklist (OAuth, HTTPS, Pega) |
+| [`tests/`](tests) | ~900 | 195 pytest tests: acceptance AT-1…AT-8, boundaries, validation, self-check, log hygiene, 1,500-row reproduction, LLM guardrails (fake model, real llama3.2 outputs, deadline), server, OAuth (forged, expired and wrong-audience tokens, key rotation, startup check) |
+| [`../.github/workflows/fraud-risk-agent.yml`](../.github/workflows/fraud-risk-agent.yml) | ~155 | CI: tests + evaluation, the `ollama-smoke` job with the real model, the `docker` job (builds the image and runs the Compose stack, incl. the Ollama profile) and the `oauth` job (real Keycloak token) |
+| [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml), [`.env.example`](.env.example) | – | Container image (non-root, health check) and Compose stack with optional Ollama and Keycloak; see [DEPLOYMENT.md](DEPLOYMENT.md) |
+| [`keycloak/`](keycloak) | – | Test realm for the local Keycloak (`claims-realm.json`) and `get-token.sh`, which fetches a token the way Pega will |
+| [`DEPLOYMENT.md`](DEPLOYMENT.md) | – | Short deployment guide: run, optional LLM, health checks, OAuth 2.0 (Keycloak, Entra ID, Okta), production checklist (HTTPS, Pega) |
 | [`examples/`](examples) | – | Request payloads: clean, duplicate, all indicators, missing field |
 | [`data/`](data) | – | Synthetic claims CSV and data dictionary |
 
@@ -203,8 +208,8 @@ python fra_agent.py --csv data/fra_synthetic_claims_1500.csv --limit 5
 # Evaluate the rules on all 1,500 claims
 python evaluate.py
 
-# Serve over A2A / REST (or with Docker: see DEPLOYMENT.md)
-export FRA_API_TOKEN=change-me
+# Serve over A2A / REST (or with Docker: see DEPLOYMENT.md, which also covers OAuth 2.0)
+export FRA_API_TOKEN=change-me          # local use only; production uses the FRA_OAUTH_* settings
 uvicorn server:app --port 8000          # template wording; FRA_USE_LLM=1 uvicorn ... to use Ollama
 curl -s localhost:8000/.well-known/agent.json
 curl -s -X POST localhost:8000/v1/assess -H "Authorization: Bearer $FRA_API_TOKEN" \
@@ -241,6 +246,6 @@ Each of these was needed because the source files are silent or disagree:
 5. **Forbidden-field names** are not specified, so a deny-list of likely key names is used (`FORBIDDEN_KEYS`), compared after normalising case and separators, and including the Blueprint's own property names (`PolicyNumber`, `DateOfBirth`, `ConfidenceScore`). A future optional field that happens to use one of those names (e.g. `model`) would be rejected; edit the list if Pega adds one. `correlation_id` must be a canonical UUID v4 and `claim_id` uses ASCII digits only.
 6. **Formats.** `AC-nnnn` means `AC-` followed by 4 or more digits. Hashes must be hex with 16 or more characters (SHA-256 gives 64, per O-2). Date ordering and description length (V-02, V-19) are validated by Pega, not re-checked here.
 7. **`LATE_REPORTED` wording** quotes the day gap computed from the two dates, with `LateReportDays = 30`. The flag itself always comes from Pega's boolean.
-8. **Authentication.** A static bearer token (`FRA_API_TOKEN`) stands in for OAuth 2.0 client credentials. A2A is implemented as protocol 0.3 JSON-RPC `message/send` with a DataPart (open item O-1). The business payload is decoupled from the envelope, so either can change independently.
+8. **Authentication.** Pega gets tokens with OAuth 2.0 client credentials, and the agent checks each one: signature against the provider's published keys, expiry, issuer, audience and the `fraud.assess` scope (spec §4 names OAuth 2.0 but no provider, scope or audience, so these are configurable). A static bearer token (`FRA_API_TOKEN`) remains for local use only. A2A is implemented as protocol 0.3 JSON-RPC `message/send` with a DataPart (open item O-1). The business payload is decoupled from the envelope, so either can change independently.
 9. **LLM.** The default is `llama3.2` (3B); any Ollama chat model works. With `temperature=0` and a fixed seed, wording repeats on the same model and hardware. Byte-identical repeat responses (AT-8) are strictly guaranteed in template mode (`--no-llm`, and the server default), while scores and flags are identical in every mode. On CPU-only hardware the model takes about 3–9 s per flagged claim (more on a cold start); the agent caps this at `FRA_LLM_TIMEOUT` (8 s) and then uses the template. That is above the spec's 5 s target for a normal request (§10.1), while the template-only mode meets it easily, so the server runs template-only unless `FRA_USE_LLM=1` (e.g. on a GPU host).
 10. **Labels are synthetic.** `fraud_confirmed` is generated data, so the evaluation numbers show the method, not real-world performance.
