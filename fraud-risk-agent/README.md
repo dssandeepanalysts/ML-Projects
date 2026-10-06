@@ -54,6 +54,7 @@ End to end, for one claim:
 | **Ollama** + `llama3.2` (3B) | any recent release | ✓ MIT / Llama 3.2 licence | local LLM for explanation wording (optional) | runtime |
 | `fastapi` + `uvicorn` | 0.142 / 0.50 | ✓ MIT / BSD | A2A JSON-RPC and REST endpoints, Agent Card | `server.py` |
 | `PyJWT[crypto]` | 2.13 / 2.15 | ✓ MIT | checks OAuth 2.0 access tokens: signature (provider's JWKS), expiry, issuer, audience, scope | `server.py` |
+| `pyngrok` + **ngrok** (free account) | 8.1 | ✓ MIT / free tier | public HTTPS address for the Pega test notebook (optional) | `pega_a2a_ngrok.ipynb` |
 | **Keycloak** (Docker) | 26.8 | ✓ Apache 2.0 | local identity provider to try OAuth end to end (optional, testing only) | `docker-compose.yml` |
 | `pandas`, `scikit-learn` | 3.0 / 1.9 | ✓ BSD | batch evaluation, shadow challenger model | `evaluate.py` |
 | `pytest`, `httpx` | 9.1 / 0.28 | ✓ MIT / BSD | test suite, FastAPI TestClient | `tests/` |
@@ -191,6 +192,7 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 | [`../.github/workflows/fraud-risk-agent.yml`](../.github/workflows/fraud-risk-agent.yml) | ~155 | CI: tests + evaluation, the `ollama-smoke` job with the real model, the `docker` job (builds the image and runs the Compose stack, incl. the Ollama profile) and the `oauth` job (real Keycloak token) |
 | [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml), [`.env.example`](.env.example) | – | Container image (non-root, health check) and Compose stack with optional Ollama and Keycloak; see [DEPLOYMENT.md](DEPLOYMENT.md) |
 | [`keycloak/`](keycloak) | – | Test realm for the local Keycloak (`claims-realm.json`) and `get-token.sh`, which fetches a token the way Pega will |
+| [`pega_a2a_ngrok.ipynb`](pega_a2a_ngrok.ipynb) | – | Jupyter/Colab notebook for a quick Pega test: runs the agent, gives it a public HTTPS address with ngrok (free account), and issues the OAuth 2.0 Client ID, Client Secret, Access Token Endpoint and Scope that Pega needs |
 | [`DEPLOYMENT.md`](DEPLOYMENT.md) | – | Short deployment guide: run, optional LLM, health checks, OAuth 2.0 (Keycloak, Entra ID, Okta), production checklist (HTTPS, Pega) |
 | [`examples/`](examples) | – | Request payloads: clean, duplicate, all indicators, missing field |
 | [`data/`](data) | – | Synthetic claims CSV and data dictionary |
