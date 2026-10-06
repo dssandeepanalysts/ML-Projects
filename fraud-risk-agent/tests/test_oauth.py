@@ -13,6 +13,7 @@ import logging
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import jwt
 import pytest
@@ -72,6 +73,7 @@ class Provider:
                 pass
 
         self.http = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.http.handle_error = lambda *args: None  # a client that gave up mid-trickle is expected here
         self.url = f"http://127.0.0.1:{self.http.server_port}/realms/claims/protocol/openid-connect/certs"
         threading.Thread(target=self.http.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
 
@@ -352,6 +354,43 @@ def test_a_stalled_key_endpoint_holds_up_no_request_for_long(client, provider, m
     wait_for_fetches()  # the slow download completes in its own thread...
     assert call(client, make_token()).status_code == 200  # ...and its keys are used, with no new fetch
     assert provider.fetches == 1
+
+
+def test_requests_waiting_for_a_slow_fetch_hold_no_worker_threads(provider, monkeypatch):
+    monkeypatch.setattr(server, "JWKS_TIMEOUT", 1.0)
+    with TestClient(server.app) as shared:  # one event loop, so one pool of worker threads for all calls
+        assert call(shared, make_token()).status_code == 200  # Pega's key is cached
+        provider.trickle = 0.2  # the next fetch takes 2 s
+        allow_next_fetch(provider)
+        forged = make_token(key=OTHER_KEY, kid="forged")
+        with ThreadPoolExecutor(60) as pool:  # more forged calls than the 40 worker threads
+            waiting = [pool.submit(call, shared, forged) for _ in range(60)]
+            time.sleep(0.3)  # all of them are now waiting for the slow fetch
+            started = time.monotonic()
+            assert call(shared, make_token()).status_code == 200
+            assert time.monotonic() - started < 0.5  # Pega's call did not queue behind them
+            assert {f.result().status_code for f in waiting} <= {401, 503}
+
+
+def test_a_download_that_never_finishes_is_abandoned(client, provider, monkeypatch, caplog):
+    monkeypatch.setattr(server, "JWKS_FETCH_SECONDS", 1)
+    provider.trickle = 0.2  # bytes keep coming, so no single read times out, but it takes 2 s
+    with caplog.at_level(logging.ERROR, logger="fra.server"):
+        assert call(client, make_token()).status_code == 503
+        wait_for_fetches()
+    assert "the key endpoint took longer than 1 s" in caplog.text
+    provider.trickle = 0  # the next allowed fetch starts afresh
+    allow_next_fetch(provider)
+    assert call(client, make_token()).status_code == 200
+    assert provider.fetches == 2
+
+
+def test_unpublished_key_id_is_401_even_when_its_refetch_fails(client, provider):
+    assert call(client, make_token()).status_code == 200
+    provider.status = 500  # the refetch the unknown kid triggers fails...
+    allow_next_fetch(provider)
+    assert call(client, make_token(key=OTHER_KEY, kid="k9")).status_code == 401  # ...but the keys are still usable
+    assert call(client, make_token()).status_code == 200
 
 
 def test_tokens_never_reach_the_log(client, caplog):

@@ -98,10 +98,13 @@ How the agent fetches the provider's keys:
 * A token signed with a key it has not seen (the provider rotated its keys) makes it fetch again,
   so key rotation needs no restart. Fetches run one at a time and at most once every 10 s, so forged
   tokens cannot make the agent flood your provider. A token with a brand-new key that arrives within
-  10 s of the previous fetch is refused until the next fetch; providers that publish new keys
-  before using them (Entra ID, Okta) avoid this.
+  10 s of the previous fetch is refused until the next fetch, and forged tokens can use up that
+  window too. Providers that publish new keys before using them (Entra ID, Okta) avoid this; in
+  Keycloak, add a new key at a lower priority than the current one, then raise its priority after
+  10 minutes.
 * If the provider cannot be reached, the agent keeps using the last keys it fetched for up to an hour.
-* A request waits at most 3 s for a fetch. The URL must answer directly: redirects are not followed.
+* A request waits at most 3 s for a fetch, without tying up a worker thread, and a download is
+  abandoned after 10 s. The URL must answer directly: redirects are not followed.
 * The URL must use https. Plain http is refused unless `FRA_OAUTH_ALLOW_HTTP=1`, which exists only for
   the local Keycloak below: over http, anyone on the network path could swap in their own keys.
 
@@ -186,7 +189,7 @@ Screen names vary between Pega versions.
 
 | Item | What you provide | What to change |
 |---|---|---|
-| **OAuth 2.0** (spec s4) | Identity provider: issuer, audience, JWKS URL, scope (e.g. `fraud.assess`) | Set the `FRA_OAUTH_*` settings (section 4.2) and remove `FRA_API_TOKEN`. |
+| **OAuth 2.0** (spec s4) | Identity provider: issuer, audience, JWKS URL, scope (e.g. `fraud.assess`) | Set the `FRA_OAUTH_*` settings (section 4.2) and remove `FRA_API_TOKEN` and `FRA_OAUTH_ALLOW_HTTP`. |
 | **HTTPS** | A domain and a TLS certificate | Terminate TLS at your load balancer, ingress or reverse proxy, and forward to the container. A proxy on the same host uses `127.0.0.1:8000` (the default `FRA_BIND`); a proxy in Docker joins the Compose network; a remote load balancer needs `FRA_BIND` set to a private-network IP. Never publish port 8000 on a public interface: Docker-published ports bypass host firewalls such as ufw. Set `FRA_PUBLIC_URL=https://<your-domain>` so the Agent Card advertises the HTTPS endpoint. |
 | **Pega connection** | Your Pega environment | Create the Connect Agent rule from `https://<your-domain>/.well-known/agent.json` (skill `assess_fraud_risk`). Give it the OAuth 2.0 authentication profile (section 4.3). Confirm the A2A version and DataPart shape (spec open items O-1, O-3). `POST /v1/assess` is the Connect-REST fallback. |
 
@@ -214,8 +217,8 @@ To roll back, tag each release image (`fraud-risk-agent:<version>`) and start th
 | `Refusing to start: OAuth is half configured` | Set `FRA_OAUTH_ISSUER`, `FRA_OAUTH_AUDIENCE` and `FRA_OAUTH_JWKS_URL` together. |
 | `401` on every call (static token) | The token Pega sends does not match `FRA_API_TOKEN`. |
 | `Refusing to start: FRA_OAUTH_JWKS_URL uses plain http` | Use the provider's https key URL. Only for the local Keycloak, set `FRA_OAUTH_ALLOW_HTTP=1`. |
-| `401`, log `token rejected: <reason>` (OAuth) | `InvalidIssuerError`: `FRA_OAUTH_ISSUER` differs from the token's `iss` (a trailing slash, or `localhost` vs another host name). `InvalidAudienceError`: wrong `FRA_OAUTH_AUDIENCE`, or the provider does not add it. `ExpiredSignatureError`: an expired token, or the agent's clock is ahead of the provider's by more than the token's lifetime. `ImmatureSignatureError`: the token's `iat` or `nbf` is in the future, usually because the agent's clock is more than 30 s behind the provider's: sync the host clock (NTP). `UnknownSigningKey`: no key with the token's `kid`, because `FRA_OAUTH_JWKS_URL` belongs to another realm or tenant, or (locally) Keycloak was recreated with new keys after the token was issued: get a new token. `InvalidSignatureError`: the token was altered, or the key URL is wrong. `DecodeError`: not a JWT at all (some providers issue opaque tokens unless an API audience is requested). |
+| `401`, log `token rejected: <reason>` (OAuth) | `InvalidIssuerError`: `FRA_OAUTH_ISSUER` differs from the token's `iss` (a trailing slash, or `localhost` vs another host name). `InvalidAudienceError`: wrong `FRA_OAUTH_AUDIENCE`, or the provider does not add it. `ExpiredSignatureError`: an expired token, or the agent's clock is ahead of the provider's by more than the token's lifetime. `ImmatureSignatureError`: the token's `iat` or `nbf` is in the future, usually because the agent's clock is more than 30 s behind the provider's: sync the host clock (NTP). `UnknownSigningKey`: no key with the token's `kid`, because `FRA_OAUTH_JWKS_URL` belongs to another realm or tenant, or (locally) Keycloak was recreated with new keys after the token was issued: get a new token. Right after the provider starts signing with a new key it can also last a few seconds and clear by itself. `InvalidSignatureError`: the token was altered, or the key URL is wrong. `DecodeError`: not a JWT at all (some providers issue opaque tokens unless an API audience is requested). |
 | `403` | The token is valid but lacks `FRA_OAUTH_SCOPE` in `scope`, `scp` or `roles`: grant the scope (or app role) to Pega's client. |
-| `503 Cannot verify tokens right now`, log `cannot fetch signing keys from FRA_OAUTH_JWKS_URL: <reason>` | `HTTP 404`: wrong path. `HTTP 301`/`302`: the URL redirects; use the provider's `jwks_uri` exactly as its discovery document gives it. `CERTIFICATE_VERIFY_FAILED`: the provider's certificate is from a CA the image does not trust (see "Private CA" in section 4.2). `Name or service not known`, `Connection refused`, `timed out` or `did not answer within 3 s`: DNS, firewall or proxy (see section 4.2). `not a JSON Web Key Set`: the URL returns a web page, not the keys. `no usable signing keys`: the key set has no signing key with a key ID that the agent can use. |
+| `503 Cannot verify tokens right now`, log `cannot fetch signing keys from FRA_OAUTH_JWKS_URL: <reason>` | `HTTP 404`: wrong path. `HTTP 301`/`302`: the URL redirects; use the provider's `jwks_uri` exactly as its discovery document gives it. `CERTIFICATE_VERIFY_FAILED`: the provider's certificate is from a CA the image does not trust (see "Private CA" in section 4.2). `Name or service not known`, `Connection refused`, `timed out`, `did not answer within 3 s` or `took longer than 10 s`: DNS, firewall or proxy (see section 4.2). `not a JSON Web Key Set`: the URL returns a web page, not the keys. `no usable signing keys`: the key set has no signing key with a key ID that the agent can use. |
 | `llm_wording` is `on` but replies use the template | The model is not downloaded yet (run `ollama-pull`), or replies take longer than `FRA_LLM_TIMEOUT`. Check `docker compose logs fra`. |
 | `pip` TLS errors during `docker build` | Your network intercepts TLS. Build with your proxy's CA as a build secret, which does not end up in the image: `docker build --secret id=pip_cert,src=/path/to/proxy-ca.pem -t fraud-risk-agent:1.0.0 .`, then `docker compose up -d --wait` (without `--build`). |

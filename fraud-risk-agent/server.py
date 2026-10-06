@@ -24,6 +24,7 @@ FRA_LLM_TIMEOUT settings in fra_agent.py.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
@@ -35,7 +36,6 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -118,11 +118,12 @@ async def lifespan(_app: FastAPI):
 JWKS_FRESH_SECONDS = 600  # keys older than this are refetched (in the background while they still work)
 JWKS_RETRY_SECONDS = 10  # at most one fetch per this interval, whatever asks for it
 JWKS_STALE_SECONDS = 3600  # while the provider is unreachable, keep using the last keys this long
-JWKS_TIMEOUT = 3.0  # seconds a request waits for a fetch
+JWKS_TIMEOUT = 3.0  # seconds a request waits for a fetch (also urllib's limit for each network step)
+JWKS_FETCH_SECONDS = 10  # a whole download is abandoned after this long, however slowly the bytes arrive
 JWKS_MAX_BYTES = 1_000_000
 
-# One fetch at a time, in its own thread: a stalled key endpoint can tie up this thread only, never the
-# workers that answer Pega (urllib's timeout covers each socket read, not the whole download).
+# One fetch at a time, in its own thread. Requests wait for it on the event loop, so a slow key endpoint
+# never ties up the worker threads that answer Pega.
 _jwks_fetcher = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fra-jwks")
 
 
@@ -145,9 +146,17 @@ def fetch_signing_keys(url: str) -> dict[str, dict]:
     The default opener honours HTTPS_PROXY / NO_PROXY and SSL_CERT_FILE."""
     if urlparse(url).scheme not in ("http", "https"):  # urllib would also open file:// and ftp://
         raise KeysUnavailable("not an http(s) URL")
+    deadline = time.monotonic() + JWKS_FETCH_SECONDS
     try:
         with urllib.request.build_opener(_NoRedirects).open(url, timeout=JWKS_TIMEOUT) as response:
-            body = response.read(JWKS_MAX_BYTES + 1)
+            body = b""
+            while len(body) <= JWKS_MAX_BYTES:
+                if time.monotonic() > deadline:
+                    raise KeysUnavailable(f"the key endpoint took longer than {JWKS_FETCH_SECONDS:g} s")
+                chunk = response.read1(65536)  # what has arrived so far
+                if not chunk:
+                    break
+                body += chunk
     except urllib.error.HTTPError as exc:  # includes redirects, which are not followed
         exc.close()
         raise KeysUnavailable(f"HTTP {exc.code}") from None
@@ -187,7 +196,7 @@ class ProviderKeys:
         self.last_error = "no keys fetched yet"
         self.lock = threading.Lock()
 
-    def get(self, kid) -> dict:
+    async def get(self, kid) -> dict:
         """The JWK for this kid. Raises UnknownSigningKey or KeysUnavailable."""
         with self.lock:
             age = time.monotonic() - self.fetched_at
@@ -196,21 +205,22 @@ class ProviderKeys:
         if key is not None:
             return key  # if the keys are getting old, the fetch just started runs in the background
         if fetch is not None:  # a new kid (the provider rotated its keys) or no keys yet: wait for the fetch
-            try:
-                fetch.result(timeout=JWKS_TIMEOUT)
-            except FutureTimeout:
+            waiter = asyncio.wrap_future(fetch)  # waiting on the event loop costs no worker thread
+            waiter.add_done_callback(lambda w: w.cancelled() or w.exception())  # the fetch logs its own failure
+            done, _ = await asyncio.wait([waiter], timeout=JWKS_TIMEOUT)  # never cancels the shared fetch
+            if not done:
                 reason = f"the key endpoint did not answer within {JWKS_TIMEOUT:g} s"
                 with self.lock:
                     first, self.slow_fetch = self.slow_fetch is not fetch, fetch
                 if first:  # once per stalled fetch, not once per waiting request
                     log.error("cannot fetch signing keys from FRA_OAUTH_JWKS_URL: %s", reason)
-                raise KeysUnavailable(reason) from None
-            with self.lock:
-                key = self.keys.get(kid)
-            if key is not None:
-                return key
+                raise KeysUnavailable(reason)
+            # A failed fetch falls through: the keys fetched earlier may still be usable.
         with self.lock:
             usable = time.monotonic() - self.fetched_at < JWKS_STALE_SECONDS
+            key = self.keys.get(kid) if usable else None
+        if key is not None:
+            return key
         if usable:  # the provider answered recently and does not publish this kid
             raise UnknownSigningKey("no signing key matches the token's kid")
         raise KeysUnavailable(self.last_error)
@@ -243,7 +253,7 @@ def provider_keys(url: str) -> ProviderKeys:
     return ProviderKeys(url)
 
 
-def decode_access_token(token: str, settings: dict) -> dict:
+async def decode_access_token(token: str, settings: dict) -> dict:
     """Verify signature, expiry, issuer and audience; return the claims.
     Raises jwt.PyJWTError (or ValueError for a malformed token) for a bad token, KeysUnavailable otherwise."""
     try:
@@ -252,7 +262,7 @@ def decode_access_token(token: str, settings: dict) -> dict:
         raise jwt.DecodeError("malformed token header") from None
     if header.get("alg") not in OAUTH_ALGORITHMS:  # checked before any key fetch
         raise jwt.InvalidAlgorithmError("algorithm not allowed")
-    jwk = provider_keys(settings["jwks_url"]).get(header.get("kid"))
+    jwk = await provider_keys(settings["jwks_url"]).get(header.get("kid"))
     return jwt.decode(
         token,
         jwt.PyJWK(jwk, jwk.get("alg") or header["alg"]),  # "alg" is optional in a JWK (RFC 7517 s4.4)
@@ -306,8 +316,8 @@ async def authenticate(creds: HTTPAuthorizationCredentials | None = Depends(bear
         if not secrets.compare_digest(creds.credentials.encode(), _env("FRA_API_TOKEN").encode()):
             raise _reject(401, "Missing or invalid bearer token.")
         return arrived
-    try:  # in a worker thread: a key fetch must not block the event loop
-        claims = await run_in_threadpool(decode_access_token, creds.credentials, settings)
+    try:  # on the event loop: a signature check takes well under 1 ms, and waiting for keys costs no thread
+        claims = await decode_access_token(creds.credentials, settings)
     except KeysUnavailable:  # the fetch logs why
         raise _unavailable("Cannot verify tokens right now.") from None
     except (jwt.PyJWTError, ValueError, TypeError, OverflowError, RecursionError) as exc:
