@@ -79,6 +79,69 @@ def test_a2a_finds_the_claim_in_the_shapes_callers_send(client, parts):
     assert (data["status"], data["risk_score"], data["risk_flags"]) == ("COMPLETED", 70, ["DUPLICATE_PATTERN"])
 
 
+# What a Pega AI agent actually sent (captured with the notebook's step 9): one "name: value" line per
+# field, flat names, day-first dates and an extra Case ID line.
+PEGA_TEXT = """Assess the fraud risk for the following claim details:
+- claim_id: AC-3001
+- correlation_id: becf8123-10ec-4345-badb-eb03ff5d373b
+- policy_ref_hash: 69ee203de4c76da391a700eaf1770c5e
+- vin_hash: 7a855fe5850cac67ff01058ca1f0862a77f7ab5c1b7e8e3249287e8610464a50
+- vehicle_policy_mismatch: false
+- loss_cause: THEFT
+- loss_date: {loss_date}
+- loss_reported_on: {reported_on}
+- loss_description: Returned to the car at a roundabout at about 06:35 to find the infotainment screen missing.
+- claims_last_24_months: 0
+- days_since_policy_start: 3
+- late_reported: {late}
+- potential_duplicate: false
+- policy_data_available: true
+- history_data_available: true
+- Case ID: MYORG-CLAIMASS-WORK A-1031"""
+
+
+def a2a_text(client, text):
+    return client.post("/a2a", json=rpc_with([{"kind": "text", "text": text}]), headers=AUTH).json()["result"]["parts"][0]["data"]
+
+
+def test_a2a_reads_the_name_value_lines_a_pega_ai_agent_sends(client):
+    data = a2a_text(client, PEGA_TEXT.format(loss_date="30-06-2024", reported_on="01-07-2024", late="false"))
+    assert (data["status"], data["risk_score"], data["risk_flags"]) == ("COMPLETED", 20, ["EARLY_POLICY_CLAIM"])
+    assert data["reasoning"] == ("One indicator was found: the loss occurred 3 days after the policy start date. "
+                                 "No other indicators were found.")  # the CSV's expected answer for AC-3001
+
+
+@pytest.mark.parametrize("loss_date, reported_on, gap", [
+    ("30-06-2024", "05-08-2024", 36),  # day-first, as Pega wrote it
+    ("06-30-2024", "08-05-2024", 36),  # month-first, proved by the 30
+    ("2024/06/30", "2024/08/05", 36),
+    ("05-06-2024", "07-08-2024", 63),  # ambiguous: read day-first (5 June to 7 August)
+])
+def test_a2a_text_dates_are_read_without_guessing_wrong(client, loss_date, reported_on, gap):
+    data = a2a_text(client, PEGA_TEXT.format(loss_date=loss_date, reported_on=reported_on, late="true"))
+    assert data["status"] == "COMPLETED" and f"reported {gap} days after the loss date" in data["reasoning"]
+
+
+def test_a2a_accepts_flat_csv_style_fields_but_keeps_the_contract_strict(client):
+    flat = {"claim_id": "AC-1002", "correlation_id": CLAIM["correlation_id"], "policy_ref_hash": CLAIM["policy_ref_hash"],
+            "vin_hash": CLAIM["vin_hash"], "vehicle_policy_mismatch": 0, "loss_cause": "COLLISION",
+            "loss_date": "2026-09-20", "loss_reported_on": "2026-09-21", "loss_description": "Rear-ended at a signal.",
+            "claims_last_24_months": 0, "days_since_policy_start": 262, "late_reported": 0, "potential_duplicate": 1,
+            "policy_data_available": 1, "history_data_available": 1}  # the CSV's column names and 0/1 values
+    for parts in ([{"kind": "data", "data": flat}], [{"kind": "text", "text": json.dumps(flat)}]):
+        data = client.post("/a2a", json=rpc_with(parts), headers=AUTH).json()["result"]["parts"][0]["data"]
+        assert (data["status"], data["risk_score"]) == ("COMPLETED", 70)
+    # The documented nested request stays strict: 0/1 is not a boolean there.
+    nested = build_request(vehicle_policy_mismatch=0)
+    data = client.post("/a2a", json=rpc_with([{"kind": "data", "data": nested}]), headers=AUTH).json()["result"]["parts"][0]["data"]
+    assert data["status"] == "FAILED" and "vehicle_policy_mismatch" in data["reasoning"]
+
+
+def test_a2a_name_value_lines_without_a_claim_id_are_not_a_claim(client):
+    data = a2a_text(client, "Please check this one.\n- loss_cause: THEFT\n- late_reported: true")
+    assert data["status"] == "FAILED" and data["reasoning"].startswith("No claim was found")
+
+
 def test_a2a_message_without_a_claim_is_told_what_to_send(client, caplog):
     parts = [{"kind": "text", "text": "Is claim AC-1002 risky?"}, {"kind": "evil\nkind", "x": 1}]
     with caplog.at_level(logging.INFO):

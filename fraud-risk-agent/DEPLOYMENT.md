@@ -186,11 +186,20 @@ Connect-REST rule if you use the `/v1/assess` fallback. Pega fetches and renews 
 Screen names vary between Pega versions.
 
 **How Pega sends the claim.** In Pega Infinity 25 an external A2A agent is called by a Pega AI agent
-(its *External agents* list), whose language model writes the request. It usually sends the claim as
-JSON **text** rather than as a structured data part. The agent accepts both, plus the older A2A
-`"type": "data"` form and a claim wrapped in one outer object. In the Pega AI agent's instructions,
-ask it to send the claim as one JSON object with the 15 request fields; the Agent Card's skill has a
-complete example. A message without a claim (for example, a question in plain words) gets a normal
+(its *External agents* list), whose language model writes the request as **text**. In testing it sent
+one `name: value` line per field, with the CSV's flat names (`loss_cause`, `late_reported: false`) and
+day-first dates (`30-06-2024`). The agent reads that, JSON (as text or as a data part), the older A2A
+`"type": "data"` form and a claim wrapped in one outer object. This reading is plain code, and every
+value is still validated. Dates such as `30-06-2024` are read day-first unless another date in the same
+claim proves month-first; `YYYY-MM-DD` avoids any doubt. In the Pega AI agent's instructions, ask it
+to pass the 15 fields exactly as stored in the case and to write dates as `YYYY-MM-DD`; the Agent
+Card's skill has a complete example.
+
+**Check the case data, not only the call.** The agent scores what it receives. In testing, Pega's
+copy of a sample claim differed from the CSV: the policy hash was cut to 32 characters, its other half
+had moved into the VIN hash, and `days_since_policy_start` read 300 instead of 3 (the next columns'
+zeros appended), so the claim scored 0 instead of 20. If a score looks wrong, compare the values in
+the request (the notebook's step 9, or the agent log's claim line) with the source data. A message without a claim (for example, a question in plain words) gets a normal
 `FAILED` answer that lists the fields to send, so the calling agent can try again. Every answer
 carries the result twice: as a data part, and as JSON text for the calling agent's language model.
 

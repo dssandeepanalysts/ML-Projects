@@ -25,10 +25,12 @@ FRA_LLM_TIMEOUT settings in fra_agent.py.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import functools
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -45,7 +47,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.concurrency import run_in_threadpool
 
-from fra_agent import AGENT_VERSION, LLM_TIMEOUT, FraudRiskAgent, build_ollama_llm, failed
+from fra_agent import AGENT_VERSION, LLM_TIMEOUT, REQUIRED_FIELDS, FraudRiskAgent, build_ollama_llm, failed
 
 logging.basicConfig(level=os.getenv("FRA_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one log line per claim is enough
@@ -338,8 +340,10 @@ PUBLIC_URL = os.getenv("FRA_PUBLIC_URL", "http://localhost:8000")
 
 
 # ---------------------------------------------------------------- A2A message <-> claim (spec s3, open item O-1)
-# Pega AI agents call external agents through their language model, which sends the claim as JSON text;
-# other callers send a data part. Both work, and so does the older A2A "type" key.
+# Pega AI agents call external agents through their language model, which writes the claim as text: JSON, or
+# one "name: value" line per field with flat names (loss_cause, late_reported: false) and dates like 30-06-2024.
+# Other callers send a data part. All of these work, and so does the older A2A "type" key. Reading them is
+# plain code, never a language model, and every value is still validated by fra_agent.validate_request.
 EXAMPLE_CLAIM = {
     "claim_id": "AC-1002",
     "correlation_id": "5b0e9a7c-2f3d-4e8a-9c1b-6d7e8f9a0b1c",
@@ -354,11 +358,12 @@ EXAMPLE_CLAIM = {
     "history_data_available": True,
 }
 HOW_TO_SEND = (
-    "Send the claim as one JSON object, in a data part or as the text of a text part, with these fields: "
-    "claim_id, correlation_id (a UUID v4), policy_ref_hash, vin_hash, vehicle_policy_mismatch (true/false), "
-    "loss {cause, date, reported_on, description}, claim_history {claims_last_24_months, "
-    "days_since_policy_start, late_reported, potential_duplicate}, policy_data_available, "
-    "history_data_available. The Agent Card's skill has a complete example."
+    "Send the claim as one JSON object (in a data part or as text), or as one 'name: value' line per field, "
+    "with these fields: claim_id, correlation_id (a UUID v4), policy_ref_hash, vin_hash, "
+    "vehicle_policy_mismatch (true/false), loss {cause, date, reported_on, description}, claim_history "
+    "{claims_last_24_months, days_since_policy_start, late_reported, potential_duplicate}, "
+    "policy_data_available, history_data_available. Write dates as YYYY-MM-DD. "
+    "The Agent Card's skill has a complete example."
 )
 TEXT_SCAN_LIMIT = 65_536  # characters of a text part searched for the claim
 
@@ -380,6 +385,91 @@ def _json_object_in(text: str):
     return None
 
 
+# Flat field names, as in the data dictionary's CSV columns ("loss_cause"), mapped to request paths.
+FLAT_NAMES = {path.split(".")[-1]: path for path in REQUIRED_FIELDS} | {
+    path.replace(".", "_"): path for path in REQUIRED_FIELDS if path.startswith("loss.")}
+FLAT_NAMES.pop("date")  # "date" alone is too vague; loss_date / loss.date are accepted
+FIELD_LINE = re.compile(r"\s*(?:[-*\u2022]+|\d+[.)])?\s*[*_`]*([A-Za-z][\w .-]*?)[*_`]*\s*[:=]\s*(.*?)\s*,?\s*")
+NUMERIC_DATE = re.compile(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})")
+YEAR_FIRST_DATE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})")
+
+
+def _typed(value, kind):
+    """A text value as the type the request needs ("false" -> False, "3" -> 3). Anything else is left
+    as it is, so validation names the field."""
+    if isinstance(value, str):
+        value = value.strip().strip("\"'`").strip()
+        if kind is bool and value.lower() in ("true", "yes", "1", "false", "no", "0"):
+            return value.lower() in ("true", "yes", "1")
+        if kind is int and re.fullmatch(r"-?\d+", value):
+            return int(value)
+    elif kind is bool and type(value) is int and value in (0, 1):  # the CSV's 0/1
+        return bool(value)
+    return value
+
+
+def _iso_dates(loss) -> None:
+    """Dates written as 30-06-2024 or 2024/06/30 become 2024-06-30. Day-first unless a date in the same
+    claim proves month-first (a middle number above 12). YYYY-MM-DD needs no guessing."""
+    if not isinstance(loss, dict):
+        return
+    dated = {k: v.strip() for k in ("date", "reported_on") if isinstance(v := loss.get(k), str)}
+    numeric = {k: m for k, v in dated.items() if (m := NUMERIC_DATE.fullmatch(v))}
+    month_first = any(int(m.group(2)) > 12 for m in numeric.values())
+    for key, text in dated.items():
+        if m := YEAR_FIRST_DATE.fullmatch(text):
+            year, month, day = (int(x) for x in m.groups())
+        elif m := numeric.get(key):
+            first, second, year = (int(x) for x in m.groups())
+            day, month = (second, first) if month_first else (first, second)
+        else:
+            continue
+        try:
+            loss[key] = datetime.date(year, month, day).isoformat()
+        except ValueError:
+            pass  # not a real date: left as it is, so validation names the field
+
+
+def _claim_from_fields(fields: dict):
+    """A request built from flat name/value pairs, or None if there is no claim_id among them."""
+    claim: dict = {}
+    for name, value in fields.items():
+        key = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_").removeprefix("claim_history_")
+        path = FLAT_NAMES.get(key)
+        if path is None:
+            continue  # e.g. "Case ID": not part of the request
+        *parents, leaf = path.split(".")
+        node = claim
+        for parent in parents:
+            node = node.setdefault(parent, {})
+        node.setdefault(leaf, _typed(value, REQUIRED_FIELDS[path]))
+    if "claim_id" not in claim:
+        return None
+    _iso_dates(claim.get("loss"))
+    return claim
+
+
+def _fields_in_text(text: str) -> dict:
+    """{name: value} from lines such as "- loss_cause: THEFT" or "claim_id = AC-3001"."""
+    fields = {}
+    for line in text[:TEXT_SCAN_LIMIT].splitlines():
+        if m := FIELD_LINE.fullmatch(line):
+            fields.setdefault(m.group(1), m.group(2))
+    return fields
+
+
+def _as_claim(value, from_text: bool):
+    """A found JSON value as a request: unwrapped, and converted when it uses flat field names."""
+    value = _unwrap(value)
+    if isinstance(value, dict) and "loss" not in value and "claim_history" not in value:
+        flat = _claim_from_fields(value)
+        if flat is not None:
+            return flat
+    if from_text and isinstance(value, dict):  # written by a language model: forgive its date format
+        _iso_dates(value.get("loss"))
+    return value
+
+
 def _unwrap(value):
     """{"claim": {...}} -> {...}: callers sometimes wrap the claim in one outer object."""
     if isinstance(value, dict) and "claim_id" not in value:
@@ -399,12 +489,18 @@ def claim_from_message(message: dict) -> tuple[object, list[str]]:
     for part, kind in zip(parts, kinds):
         if kind == "data":
             data = part.get("data")
-            return _unwrap(_json_object_in(data) if isinstance(data, str) else data), kinds
-    for part, kind in zip(parts, kinds):
-        if kind == "text" and isinstance(part.get("text"), str):
-            found = _json_object_in(part["text"])
-            if found is not None:
-                return _unwrap(found), kinds
+            if isinstance(data, str):
+                return _as_claim(_json_object_in(data), from_text=True), kinds
+            return _as_claim(data, from_text=False), kinds
+    texts = [part["text"] for part, kind in zip(parts, kinds) if kind == "text" and isinstance(part.get("text"), str)]
+    for text in texts:  # JSON first, then "name: value" lines
+        found = _json_object_in(text)
+        if found is not None:
+            return _as_claim(found, from_text=True), kinds
+    for text in texts:
+        found = _claim_from_fields(_fields_in_text(text))
+        if found is not None:
+            return found, kinds
     return None, kinds
 
 
