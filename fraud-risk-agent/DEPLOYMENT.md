@@ -185,6 +185,15 @@ client ID, client secret and scope from your provider. Attach it to the Connect 
 Connect-REST rule if you use the `/v1/assess` fallback. Pega fetches and renews the token itself.
 Screen names vary between Pega versions.
 
+**How Pega sends the claim.** In Pega Infinity 25 an external A2A agent is called by a Pega AI agent
+(its *External agents* list), whose language model writes the request. It usually sends the claim as
+JSON **text** rather than as a structured data part. The agent accepts both, plus the older A2A
+`"type": "data"` form and a claim wrapped in one outer object. In the Pega AI agent's instructions,
+ask it to send the claim as one JSON object with the 15 request fields; the Agent Card's skill has a
+complete example. A message without a claim (for example, a question in plain words) gets a normal
+`FAILED` answer that lists the fields to send, so the calling agent can try again. Every answer
+carries the result twice: as a data part, and as JSON text for the calling agent's language model.
+
 ## 5. Before production: steps that need your infrastructure details
 
 | Item | What you provide | What to change |
@@ -218,6 +227,8 @@ To roll back, tag each release image (`fraud-risk-agent:<version>`) and start th
 | `401` on every call (static token) | The token Pega sends does not match `FRA_API_TOKEN`. |
 | `Refusing to start: FRA_OAUTH_JWKS_URL uses plain http` | Use the provider's https key URL. Only for the local Keycloak, set `FRA_OAUTH_ALLOW_HTTP=1`. |
 | `401`, log `token rejected: <reason>` (OAuth) | `InvalidIssuerError`: `FRA_OAUTH_ISSUER` differs from the token's `iss` (a trailing slash, or `localhost` vs another host name). `InvalidAudienceError`: wrong `FRA_OAUTH_AUDIENCE`, or the provider does not add it. `ExpiredSignatureError`: an expired token, or the agent's clock is ahead of the provider's by more than the token's lifetime. `ImmatureSignatureError`: the token's `iat` or `nbf` is in the future, usually because the agent's clock is more than 30 s behind the provider's: sync the host clock (NTP). `UnknownSigningKey`: no key with the token's `kid`, because `FRA_OAUTH_JWKS_URL` belongs to another realm or tenant, or (locally) Keycloak was recreated with new keys after the token was issued: get a new token. Right after the provider starts signing with a new key it can also last a few seconds and clear by itself. `InvalidSignatureError`: the token was altered, or the key URL is wrong. `DecodeError`: not a JWT at all (some providers issue opaque tokens unless an API audience is requested). |
+| `FAILED`: "No claim was found in the message" | Pega's message had no JSON object in it, typically a Pega AI agent asking in plain words. Tell that agent, in its instructions, to send the claim as one JSON object (see section 4.3); the log line `a2a: no claim found in the message (parts: ...)` shows which kinds of parts it sent. With the notebook, step 9 shows the full message. |
+| `-32602 Invalid params` | The JSON-RPC request has no `params.message.parts` list at all: check the A2A version your Pega uses (spec open item O-1). |
 | `403` | The token is valid but lacks `FRA_OAUTH_SCOPE` in `scope`, `scp` or `roles`: grant the scope (or app role) to Pega's client. |
 | `503 Cannot verify tokens right now`, log `cannot fetch signing keys from FRA_OAUTH_JWKS_URL: <reason>` | `HTTP 404`: wrong path. `HTTP 301`/`302`: the URL redirects; use the provider's `jwks_uri` exactly as its discovery document gives it. `CERTIFICATE_VERIFY_FAILED`: the provider's certificate is from a CA the image does not trust (see "Private CA" in section 4.2). `Name or service not known`, `Connection refused`, `timed out`, `did not answer within 3 s` or `took longer than 10 s`: DNS, firewall or proxy (see section 4.2). `not a JSON Web Key Set`: the URL returns a web page, not the keys. `no usable signing keys`: the key set has no signing key with a key ID that the agent can use. |
 | `llm_wording` is `on` but replies use the template | The model is not downloaded yet (run `ollama-pull`), or replies take longer than `FRA_LLM_TIMEOUT`. Check `docker compose logs fra`. |

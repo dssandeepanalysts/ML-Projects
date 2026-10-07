@@ -337,6 +337,77 @@ app = FastAPI(title="Fraud Risk Agent", version=AGENT_VERSION, lifespan=lifespan
 PUBLIC_URL = os.getenv("FRA_PUBLIC_URL", "http://localhost:8000")
 
 
+# ---------------------------------------------------------------- A2A message <-> claim (spec s3, open item O-1)
+# Pega AI agents call external agents through their language model, which sends the claim as JSON text;
+# other callers send a data part. Both work, and so does the older A2A "type" key.
+EXAMPLE_CLAIM = {
+    "claim_id": "AC-1002",
+    "correlation_id": "5b0e9a7c-2f3d-4e8a-9c1b-6d7e8f9a0b1c",
+    "policy_ref_hash": "dcec50fe0267059456d6f6872195e28bc3b2cdfd425dccd8a115ee7d2255f220",
+    "vin_hash": "1473895b7794b967de1cd38c9f5636569a118f099b0f630d7d3dc315e924e2fd",
+    "vehicle_policy_mismatch": False,
+    "loss": {"cause": "COLLISION", "date": "2026-09-20", "reported_on": "2026-09-21",
+             "description": "Rear-ended at a signal while waiting for the light to change."},
+    "claim_history": {"claims_last_24_months": 0, "days_since_policy_start": 262, "late_reported": False,
+                      "potential_duplicate": True},
+    "policy_data_available": True,
+    "history_data_available": True,
+}
+HOW_TO_SEND = (
+    "Send the claim as one JSON object, in a data part or as the text of a text part, with these fields: "
+    "claim_id, correlation_id (a UUID v4), policy_ref_hash, vin_hash, vehicle_policy_mismatch (true/false), "
+    "loss {cause, date, reported_on, description}, claim_history {claims_last_24_months, "
+    "days_since_policy_start, late_reported, potential_duplicate}, policy_data_available, "
+    "history_data_available. The Agent Card's skill has a complete example."
+)
+TEXT_SCAN_LIMIT = 65_536  # characters of a text part searched for the claim
+
+
+def _json_object_in(text: str):
+    """The first JSON object in a text: the whole text, or one inside prose or a ``` block."""
+    decoder, text = json.JSONDecoder(), text[:TEXT_SCAN_LIMIT]
+    start = text.find("{")
+    for _ in range(20):  # bounded, so a text full of stray braces cannot keep a worker busy
+        if start < 0:
+            break
+        try:
+            value, _ = decoder.raw_decode(text, start)
+            if isinstance(value, dict):
+                return value
+        except (ValueError, RecursionError):
+            pass
+        start = text.find("{", start + 1)
+    return None
+
+
+def _unwrap(value):
+    """{"claim": {...}} -> {...}: callers sometimes wrap the claim in one outer object."""
+    if isinstance(value, dict) and "claim_id" not in value:
+        inner = [v for v in value.values() if isinstance(v, dict) and "claim_id" in v]
+        if len(inner) == 1:
+            return inner[0]
+    return value
+
+
+def claim_from_message(message: dict) -> tuple[object, list[str]]:
+    """The claim in an A2A message (None if there is none) and the kinds of its parts, for the log.
+    A data part wins over text parts. Raises KeyError/TypeError/AttributeError for a malformed message."""
+    parts = message["parts"]
+    if not isinstance(parts, list) or not parts:
+        raise TypeError("the message has no parts")
+    kinds = [part.get("kind") or part.get("type") for part in parts]  # "type": A2A before version 0.3
+    for part, kind in zip(parts, kinds):
+        if kind == "data":
+            data = part.get("data")
+            return _unwrap(_json_object_in(data) if isinstance(data, str) else data), kinds
+    for part, kind in zip(parts, kinds):
+        if kind == "text" and isinstance(part.get("text"), str):
+            found = _json_object_in(part["text"])
+            if found is not None:
+                return _unwrap(found), kinds
+    return None, kinds
+
+
 def security_schemes() -> dict:
     """How callers authenticate, as the Agent Card advertises it (A2A securitySchemes, OpenAPI shapes)."""
     settings = oauth_settings()
@@ -362,18 +433,19 @@ def build_agent_card() -> dict:
         "preferredTransport": "JSONRPC",
         "version": AGENT_VERSION,  # Pega stores this as AgentCardVersion
         "capabilities": {"streaming": False, "pushNotifications": False},
-        "defaultInputModes": ["application/json"],
-        "defaultOutputModes": ["application/json"],
+        "defaultInputModes": ["application/json", "text/plain"],
+        "defaultOutputModes": ["application/json", "text/plain"],
         **security_schemes(),
         "skills": [
             {
                 "id": "assess_fraud_risk",
                 "name": "Assess fraud risk",
-                "description": "Scores five history-based fraud indicators and returns risk_score, "
-                "confidence, risk_flags and a neutral explanation.",
+                "description": "Scores five history-based fraud indicators for one motor claim and returns "
+                "status, risk_score, confidence, risk_flags and a neutral explanation (reasoning). " + HOW_TO_SEND,
                 "tags": ["fraud", "claims", "insurance"],
-                "inputModes": ["application/json"],
-                "outputModes": ["application/json"],
+                "examples": [json.dumps(EXAMPLE_CLAIM)],
+                "inputModes": ["application/json", "text/plain"],
+                "outputModes": ["application/json", "text/plain"],
             }
         ],
     }
@@ -429,23 +501,28 @@ async def a2a(request: Request, arrived: float = Depends(authenticate)) -> dict:
         return rpc_error(rpc.get("id"), -32601, "Method not found")
     try:
         message = rpc["params"]["message"]
-        claim = next(p["data"] for p in message["parts"] if p.get("kind") == "data")
-    except (KeyError, TypeError, AttributeError, StopIteration):
-        return rpc_error(rpc.get("id"), -32602, "Invalid params: expected a message with a data part")
+        claim, kinds = claim_from_message(message)
+    except (KeyError, TypeError, AttributeError):
+        return rpc_error(rpc.get("id"), -32602, "Invalid params: expected params.message with a list of parts")
 
-    result = await run_in_threadpool(_assess, claim, arrived)
+    if claim is None:  # e.g. a question in plain words: say what to send, so a calling agent can retry
+        seen = ", ".join(k if k in ("text", "data", "file") else "other" for k in kinds)  # never the content
+        log.warning("a2a: no claim found in the message (parts: %s)", seen)
+        result = failed("No claim was found in the message. " + HOW_TO_SEND)
+    else:
+        result = await run_in_threadpool(_assess, claim, arrived)
     message_id = message.get("messageId")
-    return {
-        "jsonrpc": "2.0",
-        "id": rpc.get("id"),
-        "result": {
-            "kind": "message",
-            "role": "agent",
-            # Derived from the request's messageId, so a repeat call gets an identical reply.
-            "messageId": str(uuid.uuid5(uuid.NAMESPACE_URL, message_id if isinstance(message_id, str) else "")),
-            "parts": [{"kind": "data", "data": result}],
-        },
+    reply = {
+        "kind": "message",
+        "role": "agent",
+        # Derived from the request's messageId, so a repeat call gets an identical reply.
+        "messageId": str(uuid.uuid5(uuid.NAMESPACE_URL, message_id if isinstance(message_id, str) else "")),
+        # The same result twice: as data for programs, as JSON text for a calling agent's language model.
+        "parts": [{"kind": "data", "data": result}, {"kind": "text", "text": json.dumps(result, ensure_ascii=False)}],
     }
+    if isinstance(message.get("contextId"), str):
+        reply["contextId"] = message["contextId"]  # keeps the reply in the caller's conversation
+    return {"jsonrpc": "2.0", "id": rpc.get("id"), "result": reply}
 
 
 @app.post("/v1/assess")
