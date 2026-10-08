@@ -1,0 +1,95 @@
+# Template wording only (default):   docker compose up -d --build
+# With local Ollama wording:          FRA_USE_LLM=1 docker compose --profile llm up -d --build
+# With a local Keycloak for OAuth:    docker compose --profile oauth up -d --build
+# Settings come from .env (copy .env.example). See DEPLOYMENT.md.
+services:
+  fra:
+    build: .
+    image: fraud-risk-agent:1.0.0
+    ports:
+      # Loopback only by default: put your TLS proxy in front (DEPLOYMENT.md s5). Docker-published
+      # ports bypass host firewalls such as ufw, so only widen FRA_BIND on a private network.
+      - "${FRA_BIND:-127.0.0.1}:${FRA_PORT:-8000}:8000"
+    environment:
+      # Authentication: the FRA_OAUTH_* settings (production) or FRA_API_TOKEN (local use).
+      # With neither, the container stops at startup and its log says why.
+      FRA_API_TOKEN: ${FRA_API_TOKEN:-}
+      FRA_OAUTH_ISSUER: ${FRA_OAUTH_ISSUER:-}
+      FRA_OAUTH_AUDIENCE: ${FRA_OAUTH_AUDIENCE:-}
+      FRA_OAUTH_JWKS_URL: ${FRA_OAUTH_JWKS_URL:-}
+      FRA_OAUTH_SCOPE: ${FRA_OAUTH_SCOPE:-fraud.assess}
+      FRA_OAUTH_TOKEN_URL: ${FRA_OAUTH_TOKEN_URL:-}
+      FRA_OAUTH_ALLOW_HTTP: ${FRA_OAUTH_ALLOW_HTTP:-}  # 1 only for the local Keycloak below
+      FRA_PUBLIC_URL: ${FRA_PUBLIC_URL:-http://localhost:8000}
+      FRA_USE_LLM: ${FRA_USE_LLM:-0}
+      FRA_OLLAMA_MODEL: ${FRA_OLLAMA_MODEL:-llama3.2}
+      FRA_LLM_TIMEOUT: ${FRA_LLM_TIMEOUT:-8}
+      FRA_LOG_LEVEL: ${FRA_LOG_LEVEL:-INFO}
+      OLLAMA_HOST: http://ollama:11434
+    restart: unless-stopped
+    stop_grace_period: 25s  # longer than uvicorn's 20 s graceful shutdown (Docker's default is 10 s)
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The health check is defined in the Dockerfile (GET /health every 30 s).
+
+  # Optional local LLM. Only started with --profile llm. If it is missing, slow or still
+  # downloading the model, the agent answers with the template wording.
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.35.1}
+    profiles: ["llm"]
+    volumes:
+      - ollama:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h  # keep the model loaded: a cold start takes 10-17 s on CPU
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # One-off job: downloads the model into the ollama volume, then exits.
+  ollama-pull:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.35.1}
+    profiles: ["llm"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "${FRA_OLLAMA_MODEL:-llama3.2}"]
+    restart: "no"
+
+  # Optional local identity provider, to try OAuth end to end. Dev mode: never use it in production.
+  # Only started with --profile oauth. Imports keycloak/claims-realm.json (realm "claims", client
+  # "pega-claim-assist", scope "fraud.assess") and generates a new client secret on every recreate.
+  keycloak:
+    image: keycloak/keycloak:${KEYCLOAK_VERSION:-26.8}
+    profiles: ["oauth"]
+    # Checks the admin password here: a required ${...:?} in the file would also stop runs without this profile.
+    entrypoint: ["bash", "-c", "[ -n \"$$KC_BOOTSTRAP_ADMIN_PASSWORD\" ] || { echo 'Set KC_ADMIN_PASSWORD in .env' >&2; exit 1; }; exec /opt/keycloak/bin/kc.sh \"$$@\"", "kc.sh"]
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD:-}
+      KC_HOSTNAME: http://localhost:${KC_PORT:-8180}  # becomes the tokens' issuer (FRA_OAUTH_ISSUER)
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"  # lets the agent fetch keys from http://keycloak:8080
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "127.0.0.1:${KC_PORT:-8180}:8080"
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\r\n\r\n' >&3 && grep -q UP <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+volumes:
+  ollama:

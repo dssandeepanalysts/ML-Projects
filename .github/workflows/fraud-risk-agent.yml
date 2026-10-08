@@ -1,0 +1,157 @@
+name: fraud-risk-agent
+
+on:
+  pull_request:
+    paths: ["fraud-risk-agent/**", ".github/workflows/fraud-risk-agent.yml"]
+  push:
+    branches: [main]
+    paths: ["fraud-risk-agent/**", ".github/workflows/fraud-risk-agent.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: fraud-risk-agent
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: fraud-risk-agent/requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Unit and acceptance tests (no Ollama needed)
+        run: python -m pytest -v
+      - name: Reproduce all 1,500 synthetic claims and report metrics
+        run: python evaluate.py
+
+  # Runs the real local model so the LLM wording path is exercised end to end.
+  # Informational: scores and flags are asserted; wording falls back to the template if rejected.
+  ollama-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: fraud-risk-agent/requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Install Ollama and pull llama3.2
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          for i in $(seq 1 30); do curl -sf http://localhost:11434 >/dev/null && break; sleep 1; done
+          curl -sf http://localhost:11434 >/dev/null || (ollama serve > /tmp/ollama.log 2>&1 &)
+          for i in $(seq 1 30); do curl -sf http://localhost:11434 >/dev/null && break; sleep 1; done
+          ollama pull llama3.2
+      - name: Score flagged claims with the real model
+        env:
+          FRA_LLM_TIMEOUT: "120"  # measure wording quality here, not runner speed
+        run: |
+          python - <<'PY'
+          import logging, time
+          from fra_agent import FraudRiskAgent, build_ollama_llm, read_csv_rows, row_to_request
+
+          logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+          llm_agent, template_agent = FraudRiskAgent(llm=build_ollama_llm()), FraudRiskAgent()
+          rows = [r for r in read_csv_rows("data/fra_synthetic_claims_1500.csv") if r["risk_flags"] != "[]"][:15]
+          accepted = 0
+          for row in rows:
+              request = row_to_request(row)
+              started = time.perf_counter()
+              llm, template = llm_agent.assess(request), template_agent.assess(request)
+              seconds = time.perf_counter() - started
+              assert {k: llm[k] for k in ("status", "risk_score", "confidence", "risk_flags")} == \
+                     {k: template[k] for k in ("status", "risk_score", "confidence", "risk_flags")}
+              used = llm["reasoning"] != template["reasoning"]
+              accepted += used
+              print(f"{row['claim_id']} {'LLM     ' if used else 'TEMPLATE'} {seconds:5.1f}s | {llm['reasoning']}")
+          print(f"\nLLM wording accepted for {accepted}/{len(rows)} flagged claims")
+          PY
+
+  # Builds the real Dockerfile and runs the docker-compose stack the way DEPLOYMENT.md describes.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FRA_API_TOKEN: ci-token
+      FRA_LLM_TIMEOUT: "10"  # the supported maximum: larger values leave no queueing room under Pega's 15 s
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start (template only)
+        run: docker compose up -d --build --wait
+      - name: Smoke test the container
+        run: |
+          curl -fsS localhost:8000/health
+          test "$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q fra)")" = healthy
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8000/v1/assess -d '{}')" = 401
+          curl -fsS -X POST localhost:8000/v1/assess -H "Authorization: Bearer $FRA_API_TOKEN" \
+               -H "Content-Type: application/json" -d @examples/request_duplicate.json \
+            | python3 -c "import json,sys; r=json.load(sys.stdin); print(r); assert (r['status'], r['risk_score']) == ('COMPLETED', 70)"
+      - name: Start with the Ollama profile and pull the model
+        env:
+          FRA_USE_LLM: "1"
+        run: |
+          docker compose --profile llm up -d --wait fra ollama
+          docker compose --profile llm run --rm ollama-pull
+          curl -fsS localhost:8000/health | grep -q '"llm_wording":"on"'
+          docker compose exec -T ollama ollama run llama3.2 "Say OK." > /dev/null   # load the model once
+          # The first call also fills Ollama's prompt cache with the system prompt; the second is fast.
+          for attempt in 1 2; do
+            curl -fsS -X POST localhost:8000/v1/assess -H "Authorization: Bearer $FRA_API_TOKEN" \
+                 -H "Content-Type: application/json" -d @examples/request_duplicate.json
+            echo
+          done
+          docker compose logs fra | grep "narrative="
+          docker compose logs fra | grep -q "narrative=llm"   # the reply was worded by the model
+      - name: Container logs
+        if: always()
+        run: docker compose --profile llm logs --no-color | tail -50
+      - name: Clean up
+        if: always()
+        run: docker compose --profile llm down -v
+
+  # The real OAuth 2.0 flow, as DEPLOYMENT.md describes it: a local Keycloak issues a client-credentials
+  # token and the agent checks it against Keycloak's signing keys.
+  oauth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the agent and Keycloak (oauth profile)
+        run: |
+          cat > .env <<EOF
+          KC_ADMIN_PASSWORD=$(openssl rand -hex 16)
+          FRA_OAUTH_ISSUER=http://localhost:8180/realms/claims
+          FRA_OAUTH_AUDIENCE=fraud-risk-agent
+          FRA_OAUTH_JWKS_URL=http://keycloak:8080/realms/claims/protocol/openid-connect/certs
+          FRA_OAUTH_TOKEN_URL=http://localhost:8180/realms/claims/protocol/openid-connect/token
+          FRA_OAUTH_ALLOW_HTTP=1
+          EOF
+          docker compose --profile oauth up -d --build --wait
+      - name: Call the agent with a Keycloak token
+        run: |
+          TOKEN=$(keycloak/get-token.sh)
+          echo "::add-mask::$TOKEN"
+          curl -fsS -X POST localhost:8000/v1/assess -H "Authorization: Bearer $TOKEN" \
+               -H "Content-Type: application/json" -d @examples/request_duplicate.json \
+            | python3 -c "import json,sys; r=json.load(sys.stdin); print(r); assert (r['status'], r['risk_score']) == ('COMPLETED', 70)"
+          for auth in "" "Authorization: Bearer not-a-jwt" "Authorization: Bearer ${TOKEN%.*}.AAAA"; do
+            test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8000/v1/assess -H "$auth" -d @examples/request_duplicate.json)" = 401
+          done
+          curl -fsS localhost:8000/.well-known/agent.json | python3 -c \
+            "import json,sys; c=json.load(sys.stdin); assert c['security'] == [{'oauth2': ['fraud.assess']}], c"
+      - name: Container logs
+        if: always()
+        run: docker compose --profile oauth logs --no-color | tail -40
+      - name: Clean up
+        if: always()
+        run: docker compose --profile oauth down -v

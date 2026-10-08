@@ -1,0 +1,21 @@
+{
+  "claim_id": "AC-1001",
+  "correlation_id": "3f6c1b0a-7e2d-4c91-9a08-1d5e6f2b8c41",
+  "policy_ref_hash": "dcec50fe0267059456d6f6872195e28bc3b2cdfd425dccd8a115ee7d2255f220",
+  "vin_hash": "1473895b7794b967de1cd38c9f5636569a118f099b0f630d7d3dc315e924e2fd",
+  "vehicle_policy_mismatch": false,
+  "loss": {
+    "cause": "COLLISION",
+    "date": "2026-09-20",
+    "reported_on": "2026-09-21",
+    "description": "Rear-ended at a signal while waiting for the light to change."
+  },
+  "claim_history": {
+    "claims_last_24_months": 0,
+    "days_since_policy_start": 262,
+    "late_reported": false,
+    "potential_duplicate": false
+  },
+  "policy_data_available": true,
+  "history_data_available": true
+}

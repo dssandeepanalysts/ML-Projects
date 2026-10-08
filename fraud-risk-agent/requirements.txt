@@ -1,0 +1,8 @@
+# Agent and A2A server (also used by the Docker image)
+-r requirements-server.txt
+# Evaluation (evaluate.py)
+pandas>=2.2
+scikit-learn>=1.5
+# Tests
+pytest>=8
+httpx>=0.27
