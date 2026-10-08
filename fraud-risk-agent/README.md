@@ -173,7 +173,7 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 | **1. Ingestion & contract** | `row_to_request`, `read_csv_rows`, `validate_request`, `FAILED` responses | CLI that rejects bad payloads with the field name | `python -m pytest -k "invalid or personal or missing_field or non_object or unknown or nested"` (31 tests) · `python fra_agent.py --no-llm --request examples/request_missing_field.json` |
 | **2. Rule engine & confidence** | `fired_indicators`, `risk_score`, `compute_confidence`, self-check | deterministic scorer | `python -m pytest -k "acceptance or confidence or boundaries or at7 or at8 or out_of_range or internal_error"` (21 tests): AT-1…AT-8 exact |
 | **3. Reasoning (template, then LLM)** | `template_reasoning`; LangChain prompt → `ChatOllama`; `narrative_problems` guardrails; fallback | explanations for every claim, with or without Ollama | `python -m pytest -k "llm or llama or wording or missing_data or template_wording or chunks or queued or stream"` (72 tests, fake LLM, no Ollama needed) · `python fra_agent.py --request examples/request_all_indicators.json` (real Ollama) |
-| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 231 passed · `python evaluate.py` → 1500/1500 identical (exits non-zero otherwise) · CI runs both on every PR, plus the real-model smoke job |
+| **4. Testing & evaluation** | full pytest suite; `evaluate.py` (contract reproduction, metrics, shadow challenger) | regression suite + evaluation report | `python -m pytest` → 232 passed · `python evaluate.py` → 1500/1500 identical (exits non-zero otherwise) · CI runs both on every PR, plus the real-model smoke job |
 | **5. A2A service** | `server.py`: Agent Card, OAuth 2.0 JWT checks (or a static token locally), JSON-RPC `message/send`, REST `/v1/assess`, `/health` | HTTP service Pega can call | `python -m pytest tests/test_server.py tests/test_oauth.py` (106 tests) · `uvicorn server:app` + the curl calls below |
 | **6. Deployment** | `Dockerfile` (non-root, health check, graceful shutdown), `docker-compose.yml` (optional Ollama and Keycloak profiles), `.env.example`, [DEPLOYMENT.md](DEPLOYMENT.md) | container Pega can reach | `docker compose up -d --build --wait` → `(healthy)`; CI job `docker` builds the image and runs the stack, incl. the Ollama profile with the real model; CI job `oauth` calls the agent with a real Keycloak token |
 
@@ -188,7 +188,7 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 | [`fra_agent.py`](fra_agent.py) | ~640 | **The agent**: contract validation, rule engine, confidence, template and LLM reasoning with guardrails, self-check, CLI. Self-contained; this is the only file needed to score a claim. |
 | [`server.py`](server.py) | ~640 | A2A / REST front door (FastAPI): Agent Card, OAuth 2.0 JWT checks (static token for local use), JSON-RPC `message/send` |
 | [`evaluate.py`](evaluate.py) | ~100 | Batch evaluation and the shadow scikit-learn challenger |
-| [`tests/`](tests) | ~1,250 | 231 pytest tests: acceptance AT-1…AT-8, boundaries, validation, self-check, log hygiene, 1,500-row reproduction, LLM guardrails (fake model, real llama3.2 outputs, deadline), server, OAuth (forged, expired and wrong-audience tokens, key rotation, provider outages against a real local key endpoint, startup check) |
+| [`tests/`](tests) | ~1,250 | 232 pytest tests: acceptance AT-1…AT-8, boundaries, validation, self-check, log hygiene, 1,500-row reproduction, LLM guardrails (fake model, real llama3.2 outputs, deadline), server, OAuth (forged, expired and wrong-audience tokens, key rotation, provider outages against a real local key endpoint, startup check) |
 | [`../.github/workflows/fraud-risk-agent.yml`](../.github/workflows/fraud-risk-agent.yml) | ~155 | CI: tests + evaluation, the `ollama-smoke` job with the real model, the `docker` job (builds the image and runs the Compose stack, incl. the Ollama profile) and the `oauth` job (real Keycloak token) |
 | [`Dockerfile`](Dockerfile), [`docker-compose.yml`](docker-compose.yml), [`.env.example`](.env.example) | – | Container image (non-root, health check) and Compose stack with optional Ollama and Keycloak; see [DEPLOYMENT.md](DEPLOYMENT.md) |
 | [`keycloak/`](keycloak) | – | Test realm for the local Keycloak (`claims-realm.json`) and `get-token.sh`, which fetches a token the way Pega will |
@@ -203,7 +203,8 @@ Each phase ends with a working artifact and a command that proves it. Later phas
 # Tests (no Ollama needed)
 python -m pytest
 
-# Score claims from the command line (add --no-llm to skip Ollama)
+# Score claims from the command line (add --no-llm to skip Ollama). With no options at all
+# (e.g. an IDE's Run button), it scores the example requests in examples/.
 python fra_agent.py --request examples/request_duplicate.json
 python fra_agent.py --csv data/fra_synthetic_claims_1500.csv --claim-id AC-3047   # an injection-test row
 python fra_agent.py --csv data/fra_synthetic_claims_1500.csv --limit 5

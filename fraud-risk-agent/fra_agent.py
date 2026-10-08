@@ -31,11 +31,13 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import date
+from pathlib import Path
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
@@ -606,7 +608,23 @@ class FraudRiskAgent:
 # ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
+def demo() -> None:
+    """What running the file with no options does (e.g. an IDE's Run button): score the example requests."""
+    print("No options given, so here are the example requests, scored with template wording (no Ollama needed).")
+    print("To score your own claims, add options: --request <file.json>, or --csv <file.csv> [--claim-id AC-nnnn].")
+    print("Run with --help for all options.\n")
+    agent = FraudRiskAgent()
+    for path in sorted((Path(__file__).resolve().parent / "examples").glob("*.json")):
+        print(f"--- {path.name}")
+        print(json.dumps(agent.assess(json.loads(path.read_text(encoding="utf-8"))), indent=2))
+
+
 def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        logging.basicConfig(level=logging.WARNING)  # keep the demo's output to the answers
+        demo()
+        return
     parser = argparse.ArgumentParser(description="Fraud Risk Agent: assess claims from a JSON request or the synthetic CSV.")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--request", help="path to a JSON request (spec s5)")

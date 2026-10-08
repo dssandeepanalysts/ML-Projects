@@ -489,3 +489,14 @@ def test_llm_is_not_called_when_no_indicator_fired(make_request):
     prompts = []
     FraudRiskAgent(llm=fake_llm(GOOD_REPLY, prompts)).assess(make_request())
     assert prompts == []
+
+
+def test_running_with_no_options_shows_the_examples_instead_of_an_error(capsys):
+    from fra_agent import main
+
+    main([])  # what an IDE's Run button does
+    out = capsys.readouterr().out
+    assert "--request <file.json>" in out
+    for name in ("request_all_indicators.json", "request_clean.json", "request_duplicate.json", "request_missing_field.json"):
+        assert f"--- {name}" in out
+    assert '"risk_score": 70' in out and '"status": "FAILED"' in out
