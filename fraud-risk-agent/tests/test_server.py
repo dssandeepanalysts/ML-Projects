@@ -137,6 +137,15 @@ def test_a2a_accepts_flat_csv_style_fields_but_keeps_the_contract_strict(client)
     assert data["status"] == "FAILED" and "vehicle_policy_mismatch" in data["reasoning"]
 
 
+def test_a2a_flat_or_text_claims_carrying_personal_data_are_refused_not_trimmed(client):
+    text = PEGA_TEXT.format(loss_date="30-06-2024", reported_on="01-07-2024", late="false") + "\n- Claimant Name: J. Smith"
+    data = a2a_text(client, text)
+    assert data["status"] == "FAILED" and "claimantname" in data["reasoning"] and "Smith" not in json.dumps(data)
+    flat = {"claim_id": "AC-1002", "date_of_birth": "1980-01-01", "loss_cause": "THEFT"}
+    data = client.post("/a2a", json=rpc_with([{"kind": "data", "data": flat}]), headers=AUTH).json()["result"]["parts"][0]["data"]
+    assert data["status"] == "FAILED" and "dateofbirth" in data["reasoning"] and "1980" not in json.dumps(data)
+
+
 def test_a2a_name_value_lines_without_a_claim_id_are_not_a_claim(client):
     data = a2a_text(client, "Please check this one.\n- loss_cause: THEFT\n- late_reported: true")
     assert data["status"] == "FAILED" and data["reasoning"].startswith("No claim was found")

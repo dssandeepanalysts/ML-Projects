@@ -47,7 +47,8 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.concurrency import run_in_threadpool
 
-from fra_agent import AGENT_VERSION, LLM_TIMEOUT, REQUIRED_FIELDS, FraudRiskAgent, build_ollama_llm, failed
+from fra_agent import (AGENT_VERSION, FORBIDDEN_KEYS, LLM_TIMEOUT, REQUIRED_FIELDS, FraudRiskAgent, _normalise_key,
+                       build_ollama_llm, failed)
 
 logging.basicConfig(level=os.getenv("FRA_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # one log line per claim is enough
@@ -437,6 +438,8 @@ def _claim_from_fields(fields: dict):
         key = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_").removeprefix("claim_history_")
         path = FLAT_NAMES.get(key)
         if path is None:
+            if _normalise_key(name) in FORBIDDEN_KEYS:  # e.g. "Claimant Name": kept (without its value) so
+                claim[_normalise_key(name)] = None      # validation rejects the request instead of dropping it
             continue  # e.g. "Case ID": not part of the request
         *parents, leaf = path.split(".")
         node = claim
